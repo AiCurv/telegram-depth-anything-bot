@@ -33,3 +33,4 @@ Thumbs.db
 test_outputs/
 *.depth.png
 *.original.jpg
+.vercel
