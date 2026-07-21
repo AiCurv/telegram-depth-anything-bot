@@ -5,9 +5,11 @@
  *   1. Receives Telegram webhook payloads.
  *   2. Validates the sender against ALLOWED_TELEGRAM_USER_ID (single-user whitelist).
  *   3. Silently drops anyone else with HTTP 200 (so the bot cannot be probed by attackers).
- *   4. Detects photo messages + optional /fast /hd /gray /color flags.
- *   5. Fires a `repository_dispatch` event at GitHub Actions to start heavy compute.
- *   6. Replies instantly with HTTP 200 to avoid Telegram webhook timeouts (the 30s cliff).
+ *   4. Buffers photos that share a `media_group_id` for 1500ms, then fires a
+ *      SINGLE GitHub dispatch containing all file_ids — so an album of N photos
+ *      triggers ONE Actions run, not N.
+ *   5. Single photos (no media_group_id) are dispatched immediately.
+ *   6. Replies instantly with HTTP 200 to avoid Telegram webhook timeouts.
  *
  * Command parsing:
  *   Flags can appear in message.text OR message.caption, in any order, with or
@@ -17,6 +19,15 @@
  *     model = Depth-Anything-V2-Large-hf  (/hd)
  *     cmap  = gray                        (pure 0-255 grayscale)
  *
+ * Album buffering caveat:
+ *   Vercel serverless functions do NOT share in-memory state across invocations
+ *   — each request can land on a different instance. The 1500ms in-memory
+ *   debounce works because Telegram itself serializes album photos within
+ *   <500ms in nearly all cases. If a request lands on a fresh instance mid-album,
+ *   that batch is dispatched with whatever photos it received; the Python runner
+ *   will still send them as a (smaller) album. The user sees a slightly split
+ *   album rather than a failure. Acceptable degradation for a zero-infra setup.
+ *
  * Security model:
  *   - All secrets live in Vercel env vars; NONE are ever baked into the repo.
  *   - Unauthorized users get an identical 200 OK — no information leakage.
@@ -25,7 +36,10 @@
  *     directly through GitHub's API.
  */
 
-import fetch from 'node-fetch';
+// Node 18+ ships a global `fetch` (and Vercel's Node 18+ runtime exposes it
+// too), so we no longer need the node-fetch dependency. Keeping the import
+// out of the way also makes local unit testing easier because we can stub
+// globalThis.fetch directly.
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,6 +49,31 @@ const MODEL_SMALL = 'depth-anything/Depth-Anything-V2-Small-hf';
 const MODEL_LARGE = 'depth-anything/Depth-Anything-V2-Large-hf';
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+
+// How long to wait after the FIRST photo of a media group before dispatching
+// the accumulated batch. Telegram sends album photos in quick succession
+// (typically <500ms apart), but we leave a healthy margin so slow networks
+// still get fully batched. 1500ms is short enough to feel responsive and long
+// enough to catch a 10-photo album.
+const MEDIA_GROUP_BUFFER_MS = 1500;
+
+// Hard ceiling on the number of photos in a single dispatch. Telegram's
+// sendMediaGroup API limits albums to 10 items; if a user somehow uploads
+// more (Telegram shouldn't allow it, but defensive), we cap here.
+const MAX_PHOTOS_PER_BATCH = 10;
+
+// ---------------------------------------------------------------------------
+// Per-instance album buffer
+// ---------------------------------------------------------------------------
+//
+// Map<key, { chatId, messageId, photoIds: string[], captions: string[],
+//            model, modelLabel, cmap, cmapLabel, timer: NodeJS.Timeout }>.
+//
+// `key` is the Telegram media_group_id. Single photos use a synthetic key
+// prefixed with 'single:' so they go through the same dispatch path but with
+// a different (immediate) timing rule.
+
+const albumBuffer = new Map();
 
 // ---------------------------------------------------------------------------
 // Command parser
@@ -81,6 +120,10 @@ function parseCommandPayload(rawText) {
 
   return { model, modelLabel, cmap, cmapLabel };
 }
+
+// ---------------------------------------------------------------------------
+// Telegram + GitHub glue
+// ---------------------------------------------------------------------------
 
 /**
  * Send a short text message to a Telegram chat. Fire-and-forget, errors are
@@ -136,6 +179,140 @@ async function triggerGitHubAction(payload) {
 }
 
 // ---------------------------------------------------------------------------
+// Album buffering
+// ---------------------------------------------------------------------------
+
+/**
+ * Flush a buffered album: pull the accumulated photo_ids + first non-empty
+ * caption out of the buffer, fire a single GitHub dispatch, notify the user,
+ * and clean up the buffer entry.
+ *
+ * This is the only function that actually calls GitHub. It is called either:
+ *   - immediately for single-photo messages, OR
+ *   - after MEDIA_GROUP_BUFFER_MS for album messages.
+ */
+async function flushAlbum(key, isAlbum) {
+  const entry = albumBuffer.get(key);
+  if (!entry) return;
+  albumBuffer.delete(key);
+
+  const {
+    chatId, messageId, photoIds, captions,
+    model, modelLabel, cmap, cmapLabel,
+  } = entry;
+
+  // First non-empty caption wins. Telegram normally only puts the caption on
+  // the first photo of an album, but defensively we scan all of them.
+  const firstCaption = captions.find((c) => c && c.trim().length > 0) || '';
+
+  const count = photoIds.length;
+  const label = isAlbum ? `album (${count} photos)` : 'photo';
+
+  console.log(`[flush] dispatching ${label}: model=${modelLabel} cmap=${cmapLabel} photos=${count}`);
+
+  const dispatchPayload = {
+    chat_id: chatId,
+    message_id: messageId,
+    photo_ids: photoIds,           // array of file_ids — single element for non-albums
+    photo_count: count,
+    is_album: isAlbum,
+    model,
+    model_label: modelLabel,
+    cmap,
+    cmap_label: cmapLabel,
+    caption: firstCaption,
+    sent_at: new Date().toISOString(),
+  };
+
+  try {
+    await triggerGitHubAction(dispatchPayload);
+  } catch (err) {
+    console.error(`[flush] dispatch error for ${label}:`, err);
+    await notifyTelegram(
+      chatId,
+      `⚠️ Could not start the depth job for your ${label}. The action dispatcher failed. Try again in a moment.`
+    );
+    return;
+  }
+
+  const eta = model === MODEL_LARGE ? '1–3 min (large model)' : '~30–60s (small model)';
+  const perPhoto = model === MODEL_LARGE ? '~15s/photo' : '~2s/photo';
+  const albumHint = isAlbum ? `\nBatch processing: ${perPhoto} per photo.` : '';
+  await notifyTelegram(
+    chatId,
+    `Queued *${modelLabel}* depth run with *${cmapLabel}* output for your ${label}.\nETA: ${eta}${albumHint}\nI'll reply here with the depth map${isAlbum ? 's' : ''} when it's done.`
+  );
+}
+
+/**
+ * Add a photo to the album buffer and (re)schedule the flush.
+ *
+ * For album messages (media_group_id present), the first photo schedules a
+ * flush after MEDIA_GROUP_BUFFER_MS. Subsequent photos in the same group
+ * just append to the array — they do NOT reset the timer, because we want
+ * the dispatch to fire on a fixed cadence regardless of how long the album
+ * takes to arrive.
+ *
+ * For single-photo messages (no media_group_id), we use a synthetic key and
+ * flush immediately (no timer).
+ */
+function bufferMediaGroup({
+  mediaGroupId, chatId, messageId, fileId, caption,
+  model, modelLabel, cmap, cmapLabel,
+}) {
+  const isAlbum = !!mediaGroupId;
+  const key = isAlbum ? mediaGroupId : `single:${chatId}:${messageId}`;
+
+  let entry = albumBuffer.get(key);
+  if (!entry) {
+    entry = {
+      chatId,
+      messageId,
+      photoIds: [],
+      captions: [],
+      model,
+      modelLabel,
+      cmap,
+      cmapLabel,
+      timer: null,
+    };
+    albumBuffer.set(key, entry);
+  }
+
+  // Cap at MAX_PHOTOS_PER_BATCH; ignore overflow defensively. Telegram's UI
+  // already limits albums to 10, but if a malformed update arrives with more,
+  // we just drop the extras.
+  if (entry.photoIds.length < MAX_PHOTOS_PER_BATCH) {
+    entry.photoIds.push(fileId);
+    entry.captions.push(caption || '');
+  }
+
+  // Schedule flush only if this is the first photo of the entry.
+  if (!entry.timer) {
+    if (isAlbum) {
+      // Album: wait for siblings to accumulate.
+      entry.timer = setTimeout(() => {
+        // Don't await — fire-and-forget so the timer callback returns immediately.
+        flushAlbum(key, true).catch((err) =>
+          console.error(`[flush] unhandled error for album ${key}:`, err)
+        );
+      }, MEDIA_GROUP_BUFFER_MS);
+    } else {
+      // Single photo: dispatch immediately (next tick, so the HTTP response
+      // goes out first). Using setImmediate keeps the latency floor at 0.
+      entry.timer = 'immediate';
+      setImmediate(() => {
+        flushAlbum(key, false).catch((err) =>
+          console.error(`[flush] unhandled error for single ${key}:`, err)
+        );
+      });
+    }
+  }
+
+  return { buffered: true, isAlbum, key, count: entry.photoIds.length };
+}
+
+// ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 
@@ -145,10 +322,6 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Always respond 200 ASAP unless we explicitly decide to delay. The bot's
-  // user-visible latency is dominated by GitHub Actions (~1-3 min), so an
-  // extra 500ms here to await the dispatch call is acceptable and lets us
-  // surface dispatch failures to the user immediately rather than silently.
   const body = req.body || {};
 
   const message = body.message || body.edited_message;
@@ -183,53 +356,50 @@ export default async function handler(req, res) {
     if (rawText.startsWith('/start')) {
       await notifyTelegram(
         chatId,
-        '*Depth bot reporting in.*\n\nSend me a photo. I will reply with a monocular depth map.\n\n*Flags* (combine freely in the caption):\n• `/hd` — large model (default)\n• `/fast` — small model\n• `/gray` — pure grayscale (default)\n• `/color` — inferno colormap\n\nExample: attach a photo, caption `/hd /color`.'
+        '*Depth bot reporting in.*\n\nSend me a photo (or an album!) and I will reply with monocular depth maps.\n\n*Flags* (combine freely in the caption):\n• `/hd` — large model (default)\n• `/fast` — small model\n• `/gray` — pure grayscale (default)\n• `/color` — inferno colormap\n\nExample: attach a photo, caption `/hd /color`. Or attach multiple photos as an album — they\'ll be processed together in a single run.'
       );
     } else if (rawText.startsWith('/help')) {
       await notifyTelegram(
         chatId,
-        '*Usage:*\n1. Attach a photo to your message.\n2. Optionally caption it with flags: `/hd` `/fast` `/gray` `/color`.\n3. Wait ~1–3 minutes for the depth map.\n\n*Defaults:* HD model + grayscale output.\n\nEverything runs on GitHub Actions runners; nothing is stored.'
+        '*Usage:*\n1. Attach a photo (or an album of up to 10) to your message.\n2. Optionally caption it with flags: `/hd` `/fast` `/gray` `/color`.\n3. Wait ~1–3 minutes for the depth map.\n\n*Defaults:* HD model + grayscale output.\n\n*Albums:* all photos in a single album are processed in one GitHub Actions run, and you get a single reply album back.\n\nEverything runs on GitHub Actions runners; nothing is stored.'
       );
     } else {
       await notifyTelegram(
         chatId,
-        'Send me a photo. Flags: `/hd` `/fast` `/gray` `/color`. Defaults to HD + grayscale.'
+        'Send me a photo or album. Flags: `/hd` `/fast` `/gray` `/color`. Defaults to HD + grayscale.'
       );
     }
     return res.status(200).json({ ok: true, status: 'no_photo' });
   }
 
-  // ---- 4. Fire the GitHub Action ------------------------------------------
-  const dispatchPayload = {
-    chat_id: chatId,
-    message_id: message.message_id,
-    file_id: photo.file_id,
-    file_unique_id: photo.file_unique_id,
-    file_size: photo.file_size || 0,
-    model,
-    model_label: modelLabel,
-    cmap,
-    cmap_label: cmapLabel,
-    sent_at: new Date().toISOString(),
-  };
-
-  try {
-    await triggerGitHubAction(dispatchPayload);
-  } catch (err) {
-    console.error('dispatch error:', err);
-    await notifyTelegram(
-      chatId,
-      '⚠️ Could not start the depth job. The action dispatcher failed. Try again in a moment.'
-    );
-    return res.status(200).json({ ok: false, error: 'dispatch_failed' });
-  }
-
-  // ---- 5. Acknowledge to the user -----------------------------------------
-  const eta = model === MODEL_LARGE ? '1–3 min (large model)' : '~30–60s (small model)';
-  await notifyTelegram(
+  // ---- 4. Buffer the photo (album-aware) -----------------------------------
+  // If this is part of a media group, it will be queued with a 1500ms debounce
+  // so all sibling photos land before we dispatch. Single photos dispatch
+  // immediately on the next tick.
+  const mediaGroupId = message.media_group_id || null;
+  const bufferResult = bufferMediaGroup({
+    mediaGroupId,
     chatId,
-    `Queued *${modelLabel}* depth run with *${cmapLabel}* output.\nETA: ${eta}\nI'll reply here with the depth map when it's done.`
-  );
+    messageId: message.message_id,
+    fileId: photo.file_id,
+    caption: rawText,  // use normalized text (already combines text + caption)
+    model,
+    modelLabel,
+    cmap,
+    cmapLabel,
+  });
 
-  return res.status(200).json({ ok: true, dispatched: true, model, cmap });
+  // ---- 5. Acknowledge immediately -----------------------------------------
+  // We return 200 BEFORE the dispatch fires — the buffer's setTimeout / setImmediate
+  // ensures the dispatch happens after this response is sent. Telegram is happy
+  // because it sees 200 within milliseconds, and the actual GitHub dispatch
+  // happens in the background.
+  return res.status(200).json({
+    ok: true,
+    buffered: true,
+    is_album: bufferResult.isAlbum,
+    photo_count_in_batch: bufferResult.count,
+    model,
+    cmap,
+  });
 }

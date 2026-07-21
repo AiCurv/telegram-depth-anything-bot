@@ -1,6 +1,6 @@
 {
   "name": "telegram-depth-anything-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Serverless Telegram bot that runs Depth Anything V2 monocular depth estimation via GitHub Actions.",
   "private": true,
   "license": "MIT",
@@ -8,9 +8,7 @@
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "node-fetch": "^3.3.2"
-  },
+  "dependencies": {},
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel --prod"
