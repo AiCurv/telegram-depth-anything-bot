@@ -1,0 +1,98 @@
+# .github/workflows/depth_pipeline.yml
+#
+# Async heavy-compute runner for the Telegram Depth Anything bot.
+#
+# Trigger: `repository_dispatch` with event_type=depth_request, fired by the
+# Vercel webhook (api/webhook.js). All inputs ride in `github.event.client_payload`.
+#
+# Design notes:
+#   - Public repo -> unlimited GitHub Actions minutes.
+#   - HF weights cached via actions/cache so subsequent runs boot in <2 min.
+#   - Secrets (TELEGRAM_BOT_TOKEN, GH_PAT_TOKEN) live in GitHub repo secrets,
+#     never in code. The PAT is needed so the workflow can post a check-run
+#     link back to Telegram if you ever want it.
+#   - Workflow timeout is set to 15 min — the Large model can take ~6-9 min
+#     to download weights on a cold cache, and ~3-4 min to infer + reply on
+#     a warm cache.
+
+name: Depth Pipeline
+
+on:
+  repository_dispatch:
+    types: [depth_request]
+
+  # Lets you manually test the pipeline without going through Telegram.
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: 'Telegram chat_id to reply to'
+        required: true
+      file_id:
+        description: 'Telegram file_id of the source photo'
+        required: true
+      model:
+        description: 'HF model id (small or large)'
+        required: false
+        default: 'depth-anything/Depth-Anything-V2-Small-hf'
+      mode:
+        description: 'fast | hd'
+        required: false
+        default: 'fast'
+
+# Cancel any in-flight run for the same chat_id to avoid stacking
+# duplicate runs when a user double-sends.
+concurrency:
+  group: depth-${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  infer:
+    name: Depth inference
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Restore Hugging Face cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-depth-v2-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}-${{ github.event.client_payload.model || github.event.inputs.model }}
+          restore-keys: |
+            hf-depth-v2-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}-
+            hf-depth-v2-${{ runner.os }}-
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Run depth inference + reply to Telegram
+        env:
+          CHAT_ID: ${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
+          FILE_ID: ${{ github.event.client_payload.file_id || github.event.inputs.file_id }}
+          MODEL: ${{ github.event.client_payload.model || github.event.inputs.model }}
+          MODE: ${{ github.event.client_payload.mode || github.event.inputs.mode }}
+          MESSAGE_ID: ${{ github.event.client_payload.message_id }}
+        run: |
+          python scripts/process_depth.py \
+            --chat-id "$CHAT_ID" \
+            --file-id "$FILE_ID" \
+            --model "$MODEL" \
+            --mode "$MODE" \
+            --reply-to "$MESSAGE_ID"
