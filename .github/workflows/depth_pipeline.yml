@@ -5,15 +5,22 @@
 # Trigger: `repository_dispatch` with event_type=depth_request, fired by the
 # Vercel webhook (api/webhook.js). All inputs ride in `github.event.client_payload`.
 #
+# Client payload fields (see api/webhook.js → parseCommandPayload):
+#   chat_id      — Telegram chat_id to reply to (required)
+#   message_id   — Telegram message_id of the source photo (for reply threading)
+#   file_id      — Telegram file_id of the source photo (required)
+#   model        — 'depth-anything/Depth-Anything-V2-Small-hf' | '...-Large-hf'
+#   model_label  — 'fast' | 'HD' (for display only)
+#   cmap         — 'gray' | 'inferno'  (gray = pure 0-255 grayscale, inferno = colormap)
+#   cmap_label   — human-readable render mode label (for display only)
+#
 # Design notes:
 #   - Public repo -> unlimited GitHub Actions minutes.
 #   - HF weights cached via actions/cache so subsequent runs boot in <2 min.
-#   - Secrets (TELEGRAM_BOT_TOKEN, GH_PAT_TOKEN) live in GitHub repo secrets,
-#     never in code. The PAT is needed so the workflow can post a check-run
-#     link back to Telegram if you ever want it.
-#   - Workflow timeout is set to 15 min — the Large model can take ~6-9 min
-#     to download weights on a cold cache, and ~3-4 min to infer + reply on
-#     a warm cache.
+#   - TELEGRAM_BOT_TOKEN lives in GitHub repo secrets, never in code.
+#   - Workflow timeout is 15 min — the Large model can take ~6-9 min to
+#     download weights on a cold cache, and ~3-4 min to infer + reply on a
+#     warm cache.
 
 name: Depth Pipeline
 
@@ -33,11 +40,11 @@ on:
       model:
         description: 'HF model id (small or large)'
         required: false
-        default: 'depth-anything/Depth-Anything-V2-Small-hf'
-      mode:
-        description: 'fast | hd'
+        default: 'depth-anything/Depth-Anything-V2-Large-hf'
+      cmap:
+        description: 'Render mode: gray or inferno'
         required: false
-        default: 'fast'
+        default: 'gray'
 
 # Cancel any in-flight run for the same chat_id to avoid stacking
 # duplicate runs when a user double-sends.
@@ -87,12 +94,12 @@ jobs:
           CHAT_ID: ${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
           FILE_ID: ${{ github.event.client_payload.file_id || github.event.inputs.file_id }}
           MODEL: ${{ github.event.client_payload.model || github.event.inputs.model }}
-          MODE: ${{ github.event.client_payload.mode || github.event.inputs.mode }}
+          CMAP: ${{ github.event.client_payload.cmap || github.event.inputs.cmap }}
           MESSAGE_ID: ${{ github.event.client_payload.message_id }}
         run: |
           python scripts/process_depth.py \
             --chat-id "$CHAT_ID" \
             --file-id "$FILE_ID" \
             --model "$MODEL" \
-            --mode "$MODE" \
+            --cmap "$CMAP" \
             --reply-to "$MESSAGE_ID"

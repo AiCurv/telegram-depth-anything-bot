@@ -8,7 +8,11 @@ Pipeline:
     1. Download the original photo from Telegram via getFile + file download URL.
     2. Load the requested Hugging Face pipeline (small for /fast, large for /hd).
     3. Run monocular depth estimation.
-    4. Render the depth map with matplotlib's 'inferno' colormap.
+    4. Render the depth map. Two modes:
+         - 'gray'    : normalize depth tensor to 0-255 uint8, save as a pure
+                       single-channel grayscale PNG. No colormap applied. This
+                       is the cleanest representation of relative depth.
+         - 'inferno' : apply matplotlib's 'inferno' colormap, save as RGB PNG.
     5. POST the result back to Telegram via sendPhoto, replying to the original
        message so the chat stays readable.
 
@@ -120,15 +124,20 @@ def send_telegram_text(chat_id: str, text: str) -> None:
 # Depth inference
 # ---------------------------------------------------------------------------
 
-def run_depth_inference(image_path: str, model_name: str) -> Tuple[np.ndarray, Image.Image]:
+def run_depth_inference(image_path: str, model_name: str, cmap: str) -> Tuple[np.ndarray, Image.Image]:
     """Run Depth Anything V2 on the image, returning (depth_array, source_pil).
 
+    The `cmap` argument is passed through purely so we can log it next to the
+    model name; rendering happens in `render_depth_map`. Returning the raw
+    float32 depth array gives the renderer maximum precision to work with
+    before normalization.
+
     The HF pipeline returns a dict with 'predicted_depth' (a tensor) and
-    'depth' (a PIL image, post-processed). We use 'depth' directly because
-    the pipeline already handles resize + interpolation back to source
-    resolution, but we also expose the raw array for custom colormapping.
+    'depth' (a PIL image, post-processed and interpolated back to source
+    resolution). We use 'depth' as the source of truth for the array so the
+    output dimensions always match the input photo.
     """
-    print(f"[infer] loading model: {model_name}")
+    print(f"[infer] loading model: {model_name}  (cmap={cmap})")
     t0 = time.time()
 
     # CPU-only runner; GitHub ubuntu-latest has no GPU.
@@ -147,34 +156,84 @@ def run_depth_inference(image_path: str, model_name: str) -> Tuple[np.ndarray, I
     print(f"[infer] inference took {time.time() - t1:.1f}s")
 
     depth_pil = result["depth"]
+    # Use the post-processed 'depth' PIL image — its dimensions already match
+    # the source image, so the renderer doesn't need to resize anything.
     depth_arr = np.array(depth_pil).astype(np.float32)
     return depth_arr, image
 
 
-def render_depth_png(depth_arr: np.ndarray, source: Image.Image) -> bytes:
-    """Render the depth array as an 'inferno'-colormapped PNG matching the
-    source image's aspect ratio.
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
 
-    We do NOT use plt.tight_layout() or bbox_inches='tight' — both interact
-    badly with constrained_layout. The figure is sized to the source aspect
-    ratio so the output fills the canvas with no letterboxing.
-    """
+# Cap the longest side of the output PNG at this many pixels. Telegram
+# downscales anything bigger anyway, and keeping the cap means a single
+# 4K source photo doesn't produce a 4K PNG that takes forever to upload.
+MAX_OUTPUT_SIDE = 1280
+
+
+def _resize_to_cap(source: Image.Image) -> tuple[int, int]:
+    """Return (target_w, target_h) preserving aspect ratio, longest side <= cap."""
     w, h = source.size
-    # Cap the longest side at 1280 for the visualization — keeps sendPhoto fast.
-    max_side = 1280
-    scale = max_side / max(w, h) if max(w, h) > max_side else 1.0
-    fig_w = (w * scale) / 100.0
-    fig_h = (h * scale) / 100.0
+    scale = MAX_OUTPUT_SIDE / max(w, h) if max(w, h) > MAX_OUTPUT_SIDE else 1.0
+    return int(round(w * scale)), int(round(h * scale))
+
+
+def render_depth_map(depth_arr: np.ndarray, source: Image.Image, cmap: str) -> bytes:
+    """Render the depth array as a PNG, returning the raw bytes.
+
+    Two modes:
+      - 'gray'    : min-max normalize the depth to 0-255, save as a single-
+                    channel grayscale PNG (mode='L' in PIL). No colormap is
+                    applied — the brightness directly encodes relative depth,
+                    which is the most faithful 2D representation.
+      - 'inferno' : apply matplotlib's inferno colormap, save as RGB PNG.
+                    Better for human visual scanning of depth gradients.
+
+    Both modes resize the output to <= MAX_OUTPUT_SIDE px on the longest side
+    using LANCZOS resampling, preserving aspect ratio.
+    """
+    target_w, target_h = _resize_to_cap(source)
+
+    # Resize the depth array to match the target output dimensions. We use
+    # PIL's LANCZOS for a clean, non-jagged downscale.
+    depth_pil_full = Image.fromarray(depth_arr, mode="F")
+    depth_pil_resized = depth_pil_full.resize((target_w, target_h), Image.LANCZOS)
+    depth_resized = np.array(depth_pil_resized)
+
+    if cmap == "gray":
+        # Min-max normalize to 0-255 uint8.
+        dmin = float(depth_resized.min())
+        dmax = float(depth_resized.max())
+        # Guard against divide-by-zero on a degenerate (flat) depth map.
+        rng = dmax - dmin
+        if rng < 1e-6:
+            normalized = np.zeros_like(depth_resized, dtype=np.uint8)
+        else:
+            normalized = ((depth_resized - dmin) / rng * 255.0)
+            normalized = np.clip(normalized, 0, 255).astype(np.uint8)
+
+        gray_img = Image.fromarray(normalized, mode="L")
+        buf = io.BytesIO()
+        gray_img.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+        return buf.read()
+
+    # cmap == 'inferno'
+    # Size the matplotlib figure so its pixel output matches (target_w, target_h)
+    # exactly. dpi=100 -> figsize = (pixels / 100).
+    fig_w = target_w / 100.0
+    fig_h = target_h / 100.0
 
     fig, ax = plt.subplots(
         figsize=(fig_w, fig_h),
         constrained_layout=True,
     )
-    ax.imshow(depth_arr, cmap="inferno", aspect="auto")
+    ax.imshow(depth_resized, cmap="inferno", aspect="auto")
     ax.axis("off")
 
     buf = io.BytesIO()
-    # dpi=100 makes the saved pixel dims ~= figsize * 100.
+    # pad_inches=0 + constrained_layout keeps the canvas exactly the image.
     fig.savefig(buf, format="png", dpi=100, pad_inches=0)
     plt.close(fig)
     buf.seek(0)
@@ -185,16 +244,32 @@ def render_depth_png(depth_arr: np.ndarray, source: Image.Image) -> bytes:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+# Friendly display names for the final caption.
+MODEL_LABELS = {
+    "depth-anything/Depth-Anything-V2-Small-hf": "Small (fast)",
+    "depth-anything/Depth-Anything-V2-Large-hf": "Large (HD)",
+}
+CMAP_LABELS = {
+    "gray": "grayscale",
+    "inferno": "inferno colormap",
+}
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run Depth Anything V2 on a Telegram photo.")
     p.add_argument("--chat-id", required=True)
     p.add_argument("--file-id", required=True)
     p.add_argument(
         "--model",
-        default="depth-anything/Depth-Anything-V2-Small-hf",
-        help="Hugging Face model id. Defaults to the small model.",
+        default="depth-anything/Depth-Anything-V2-Large-hf",
+        help="Hugging Face model id. Defaults to the Large (HD) model.",
     )
-    p.add_argument("--mode", default="fast", choices=["fast", "hd"])
+    p.add_argument(
+        "--cmap",
+        default="gray",
+        choices=["gray", "inferno"],
+        help="Render mode: 'gray' for pure 0-255 grayscale (default), 'inferno' for colormap.",
+    )
     p.add_argument("--reply-to", default=None, help="Telegram message_id to reply to")
     return p.parse_args()
 
@@ -206,24 +281,31 @@ def main() -> int:
     os.makedirs(workdir, exist_ok=True)
     src_path = os.path.join(workdir, "source.jpg")
 
+    model_label = MODEL_LABELS.get(args.model, args.model)
+    cmap_label = CMAP_LABELS.get(args.cmap, args.cmap)
+
     try:
         # 1. Acknowledge we're working on it.
-        send_telegram_text(args.chat_id, f"📥 Got it. Running *{args.mode}* depth estimation now…")
+        send_telegram_text(
+            args.chat_id,
+            f"📥 Got it. Running *{model_label}* depth estimation with *{cmap_label}* output now…",
+        )
 
         # 2. Pull the original photo.
         download_telegram_file(args.file_id, src_path)
 
         # 3. Run inference.
-        depth_arr, source = run_depth_inference(src_path, args.model)
+        depth_arr, source = run_depth_inference(src_path, args.model, args.cmap)
 
         # 4. Render + reply.
-        png_bytes = render_depth_png(depth_arr, source)
+        png_bytes = render_depth_map(depth_arr, source, args.cmap)
 
         stats = (
-            f"✅ *{args.mode.upper()} depth map ready.*\n"
-            f"Model: `{args.model}`\n"
+            f"✅ *Depth map ready.*\n"
+            f"Model: `{args.model}` ({model_label})\n"
+            f"Render: `{args.cmap}` ({cmap_label})\n"
             f"Source: {source.size[0]}×{source.size[1]} px\n"
-            f"Depth range: `{depth_arr.min():.1f}`–`{depth_arr.max():.1f}` (relative)"
+            f"Depth range: `{float(depth_arr.min()):.1f}`–`{float(depth_arr.max()):.1f}` (relative)"
         )
         send_telegram_photo(args.chat_id, png_bytes, stats, reply_to=args.reply_to)
         print("[main] done.")
