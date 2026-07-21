@@ -5,22 +5,27 @@
 # Trigger: `repository_dispatch` with event_type=depth_request, fired by the
 # Vercel webhook (api/webhook.js). All inputs ride in `github.event.client_payload`.
 #
-# Client payload fields (see api/webhook.js → parseCommandPayload):
+# Client payload fields (see api/webhook.js → bufferMediaGroup / flushAlbum):
 #   chat_id      — Telegram chat_id to reply to (required)
-#   message_id   — Telegram message_id of the source photo (for reply threading)
-#   file_id      — Telegram file_id of the source photo (required)
+#   message_id   — Telegram message_id of the FIRST photo (for reply threading)
+#   photo_ids    — JSON array of Telegram file_id strings (length 1 for single
+#                  photos, 1..10 for albums). Always an array — the Python
+#                  runner does NOT need to handle a bare string.
+#   photo_count  — len(photo_ids), provided as a convenience for log filtering
+#   is_album     — bool; true if photo_ids.length > 1
 #   model        — 'depth-anything/Depth-Anything-V2-Small-hf' | '...-Large-hf'
 #   model_label  — 'fast' | 'HD' (for display only)
 #   cmap         — 'gray' | 'inferno'  (gray = pure 0-255 grayscale, inferno = colormap)
 #   cmap_label   — human-readable render mode label (for display only)
+#   caption      — first non-empty caption from the album (for logging)
 #
 # Design notes:
 #   - Public repo -> unlimited GitHub Actions minutes.
 #   - HF weights cached via actions/cache so subsequent runs boot in <2 min.
 #   - TELEGRAM_BOT_TOKEN lives in GitHub repo secrets, never in code.
-#   - Workflow timeout is 15 min — the Large model can take ~6-9 min to
-#     download weights on a cold cache, and ~3-4 min to infer + reply on a
-#     warm cache.
+#   - Workflow timeout is 20 min — the Large model can take ~6-9 min to
+#     download weights on a cold cache, and processing a 10-photo album on a
+#     warm cache adds ~15s/photo = ~150s. 20 min gives comfortable headroom.
 
 name: Depth Pipeline
 
@@ -34,8 +39,8 @@ on:
       chat_id:
         description: 'Telegram chat_id to reply to'
         required: true
-      file_id:
-        description: 'Telegram file_id of the source photo'
+      photo_ids:
+        description: 'JSON array of Telegram file_ids, e.g. ["id1","id2"]'
         required: true
       model:
         description: 'HF model id (small or large)'
@@ -59,7 +64,7 @@ jobs:
   infer:
     name: Depth inference
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -92,14 +97,18 @@ jobs:
       - name: Run depth inference + reply to Telegram
         env:
           CHAT_ID: ${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
-          FILE_ID: ${{ github.event.client_payload.file_id || github.event.inputs.file_id }}
+          # GitHub Actions expression context converts arrays to a JSON string
+          # when interpolated into a scalar env var. The Python runner parses
+          # this back into a list with json.loads(). For workflow_dispatch,
+          # the input is already a JSON string.
+          PHOTO_IDS_JSON: ${{ toJSON(github.event.client_payload.photo_ids) || github.event.inputs.photo_ids }}
           MODEL: ${{ github.event.client_payload.model || github.event.inputs.model }}
           CMAP: ${{ github.event.client_payload.cmap || github.event.inputs.cmap }}
           MESSAGE_ID: ${{ github.event.client_payload.message_id }}
         run: |
           python scripts/process_depth.py \
             --chat-id "$CHAT_ID" \
-            --file-id "$FILE_ID" \
+            --photo-ids "$PHOTO_IDS_JSON" \
             --model "$MODEL" \
             --cmap "$CMAP" \
             --reply-to "$MESSAGE_ID"
