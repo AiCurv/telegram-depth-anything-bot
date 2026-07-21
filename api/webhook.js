@@ -214,14 +214,14 @@ async function flushAlbum(key, isAlbum) {
     chat_id: chatId,
     message_id: messageId,
     photo_ids: photoIds,           // array of file_ids — single element for non-albums
-    photo_count: count,
-    is_album: isAlbum,
     model,
-    model_label: modelLabel,
     cmap,
-    cmap_label: cmapLabel,
+    is_album: isAlbum,
+    // NOTE: GitHub's repository_dispatch API hard-limits client_payload to
+    // 10 properties. We pack the essentials only. The Python runner derives
+    // friendly labels from model/cmap via its own lookup tables.
+    photo_count: count,
     caption: firstCaption,
-    sent_at: new Date().toISOString(),
   };
 
   try {
