@@ -75,7 +75,12 @@ def download_telegram_file(file_id: str, dest_path: str) -> None:
 
 def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str,
                         reply_to: str | None = None) -> None:
-    """POST a PNG photo to Telegram's sendPhoto endpoint."""
+    """POST a PNG photo to Telegram's sendPhoto endpoint.
+
+    If `reply_to` is set but Telegram rejects it (e.g. message_id was from a
+    forwarded/synthetic payload and doesn't exist in this chat), we retry
+    without the reply link rather than failing the whole run.
+    """
     files = {"photo": ("depth.png", photo_bytes, "image/png")}
     data = {
         "chat_id": chat_id,
@@ -86,6 +91,14 @@ def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str,
         data["reply_to_message_id"] = reply_to
 
     r = requests.post(f"{TELEGRAM_API}/sendPhoto", files=files, data=data, timeout=60)
+    if r.status_code != 200 and reply_to:
+        # Retry without reply_to — common case: reply_to message_id is stale or
+        # was never a real Telegram message_id (synthetic test, forwarded update, etc.)
+        print(f"[telegram] sendPhoto with reply_to={reply_to} failed ({r.status_code}); retrying without reply")
+        files = {"photo": ("depth.png", photo_bytes, "image/png")}
+        data.pop("reply_to_message_id", None)
+        r = requests.post(f"{TELEGRAM_API}/sendPhoto", files=files, data=data, timeout=60)
+
     if r.status_code != 200:
         # Fall back to a text error so the user is never left hanging.
         send_telegram_text(chat_id, f"Depth finished but sendPhoto failed: {r.text[:300]}")
