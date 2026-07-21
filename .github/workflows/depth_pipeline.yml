@@ -51,11 +51,19 @@ on:
         required: false
         default: 'gray'
 
-# Cancel any in-flight run for the same chat_id to avoid stacking
-# duplicate runs when a user double-sends.
-concurrency:
-  group: depth-${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
-  cancel-in-progress: false
+# No concurrency group.
+#
+# Previously we used `depth-${{ chat_id }}` with cancel-in-progress:false to
+# queue runs for the same user. In practice GitHub Actions was cancelling
+# queued runs when a new one arrived in the same group (despite the docs
+# saying it should queue), which caused album photos to get dropped.
+#
+# Without a concurrency group, every dispatch gets its own run. This means a
+# user could theoretically stack up runs by spamming photos, but:
+#   - Single-user bot (firewall in Vercel), so abuse is self-inflicted.
+#   - GitHub Actions concurrency on public repos is unlimited.
+#   - The Vercel webhook's album buffer already collapses album photos into
+#     a single dispatch when they land on the same instance.
 
 permissions:
   contents: read

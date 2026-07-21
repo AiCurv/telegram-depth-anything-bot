@@ -103,6 +103,12 @@ You should see `"url": "https://<your-project>.vercel.app/api/webhook"` and `"pe
 
 Send a photo to your bot with caption `/hd` (large model, ~1–3 min) or `/fast` (small model, ~30–60s). You can combine model and color flags, e.g. `/fast /color` or `/hd /gray`. With no flags you get **HD + grayscale** by default.
 
+## Albums
+
+Send multiple photos as a single Telegram album and the bot will batch-process them. The Vercel webhook buffers album photos (sharing the same `media_group_id`) for 1500ms, then fires a SINGLE GitHub Actions dispatch containing all photo_ids. The Python runner loads the model once, runs inference on every photo, and replies with a single album via `sendMediaGroup`.
+
+**Best-effort caveat:** Vercel serverless functions don't share in-memory state across instances. If Telegram's album photos happen to land on different Vercel instances (uncommon but possible), each instance dispatches independently with its subset. The runner handles this gracefully — a 1-photo "album" dispatch falls back to `sendPhoto`, so you still get a correct depth map for every photo, just potentially as multiple replies instead of one album. For guaranteed cross-instance batching, wire up Vercel KV (Upstash Redis) and replace the in-memory `albumBuffer` Map with KV calls.
+
 ## Usage
 
 Flags can be combined in any order in a photo caption (or sent as a standalone text command before uploading).

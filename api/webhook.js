@@ -22,11 +22,18 @@
  * Album buffering caveat:
  *   Vercel serverless functions do NOT share in-memory state across invocations
  *   — each request can land on a different instance. The 1500ms in-memory
- *   debounce works because Telegram itself serializes album photos within
- *   <500ms in nearly all cases. If a request lands on a fresh instance mid-album,
- *   that batch is dispatched with whatever photos it received; the Python runner
- *   will still send them as a (smaller) album. The user sees a slightly split
- *   album rather than a failure. Acceptable degradation for a zero-infra setup.
+ *   debounce works when all album photos land on the SAME instance (the common
+ *   case for Telegram's rapid-fire album delivery, typically <100ms apart).
+ *   If a request lands on a fresh instance mid-album, that instance dispatches
+ *   independently with whatever photos it received. The Python runner handles
+ *   this gracefully: a 1-photo "album" dispatch falls back to sendPhoto, so
+ *   the user still gets a correct depth map for every photo — just potentially
+ *   as multiple replies instead of a single album.
+ *
+ *   For true cross-instance album batching, set up Vercel KV (Upstash Redis)
+ *   and store the buffer there instead of in `albumBuffer`. The current
+ *   implementation is zero-infra and "best effort", which is acceptable for a
+ *   single-user bot.
  *
  * Security model:
  *   - All secrets live in Vercel env vars; NONE are ever baked into the repo.
