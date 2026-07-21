@@ -78,16 +78,16 @@ Then in **Settings → Secrets and variables → Actions**, add:
 | `TELEGRAM_BOT_TOKEN` | bot token |
 | `ALLOWED_TELEGRAM_USER_ID` | your numeric Telegram user id |
 | `GH_PAT_TOKEN` | GitHub classic PAT with `repo` + `workflow` scopes |
-| `GITHUB_REPO_OWNER` | e.g. `AiCurv` |
+| `GITHUB_REPO_OWNER` | e.g. `your-github-username` |
 | `GITHUB_REPO_NAME` | `telegram-depth-anything-bot` |
 
-4. Deploy. Copy the production URL (e.g. `https://telegram-depth-anything-bot.vercel.app`).
+4. Deploy. Copy the production URL (e.g. `https://<your-project>.vercel.app`).
 
 ### 4. Wire Telegram to Vercel
 
 ```bash
 curl "https://api.telegram.org/bot<TOKEN>/setWebhook" \
-     -d "url=https://telegram-depth-anything-bot.vercel.app/api/webhook" \
+     -d "url=https://<your-project>.vercel.app/api/webhook" \
      -d "allowed_updates=%5B%22message%22%5D"
 ```
 
@@ -97,21 +97,42 @@ Verify:
 curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"
 ```
 
-You should see `"url": "https://...vercel.app/api/webhook"` and `"pending_update_count": 0`.
+You should see `"url": "https://<your-project>.vercel.app/api/webhook"` and `"pending_update_count": 0`.
 
 ### 5. Send a photo
 
-Send a photo to your bot with caption `/fast` (small model, ~30–60s) or `/hd` (large model, ~1–3 min). You'll get back an inferno-colormapped depth map.
+Send a photo to your bot with caption `/hd` (large model, ~1–3 min) or `/fast` (small model, ~30–60s). You can combine model and color flags, e.g. `/fast /color` or `/hd /gray`. With no flags you get **HD + grayscale** by default.
 
 ## Usage
 
-| Command | Meaning |
-|---------|---------|
+Flags can be combined in any order in a photo caption (or sent as a standalone text command before uploading).
+
+### Model flags
+
+| Flag | Model |
+|------|-------|
+| `/hd` or `hd` | Depth Anything V2 **Large** (default) |
+| `/fast` or `fast` | Depth Anything V2 **Small** |
+
+### Color flags
+
+| Flag | Output |
+|------|--------|
+| `/gray`, `/grayscale`, or `gray` | Pure 0–255 grayscale PNG (default) |
+| `/color`, `/inferno`, or `color` | Inferno-colormapped PNG |
+
+### Examples
+
+| Caption | Result |
+|---------|--------|
+| *(no caption)* | HD + grayscale |
+| `/fast` | Small + grayscale |
+| `/hd /color` | Large + inferno colormap |
+| `/fast /gray` | Small + grayscale |
+| `hd color` | Large + inferno (slashes optional) |
+| `/color` | Large + inferno (model defaults to HD) |
 | `/start` | Greeting + usage. |
 | `/help`  | Usage summary. |
-| photo + caption `/fast` | Small model — Depth Anything V2 Small. Default if no flag. |
-| photo + caption `/hd`   | Large model — Depth Anything V2 Large. |
-| photo (no caption)      | Defaults to small model. |
 
 ## Models
 

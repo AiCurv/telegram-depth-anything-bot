@@ -127,7 +127,7 @@ export default async function handler(req, res) {
     if (text.startsWith('/start')) {
       await notifyTelegram(
         chatId,
-        '*Depthbrobot reporting in.*\n\nSend me a photo. I will reply with a monocular depth map.\n\nFlags:\n• `/fast` — small model (~30s)\n• `/hd` — large model (~90s)\n\nExample: attach a photo, caption `/hd`.'
+        '*Depth bot reporting in.*\n\nSend me a photo. I will reply with a monocular depth map.\n\nFlags:\n• `/fast` — small model (~30s)\n• `/hd` — large model (~90s)\n\nExample: attach a photo, caption `/hd`.'
       );
     } else if (text.startsWith('/help')) {
       await notifyTelegram(
