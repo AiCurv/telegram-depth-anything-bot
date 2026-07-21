@@ -1,0 +1,52 @@
+# wrangler.toml — Cloudflare Worker configuration
+#
+# This Worker replaces the previous Vercel serverless webhook. The reason for
+# the migration is album buffering: Vercel serverless functions do not share
+# in-memory state across invocations, so album photos that landed on different
+# instances were dispatched separately (one GitHub Actions run per photo
+# instead of one run per album).
+#
+# Cloudflare KV gives us durable, cross-instance state. Each album photo is
+# stored under its own KV key (`album:{media_group_id}:{message_id}`), and
+# a 1500ms debounced flush gathers all siblings and fires ONE dispatch per
+# album — regardless of which Cloudflare colo handled each request.
+#
+# Setup (run from repo root):
+#   1. Install wrangler:   npm install -g wrangler
+#   2. Authenticate:       export CLOUDFLARE_API_TOKEN=...
+#                          export CLOUDFLARE_ACCOUNT_ID=...
+#   3. Create KV namespace:
+#        wrangler kv namespace create ALBUM_BUFFER
+#      Paste the returned id below into `kv_namespaces.id`.
+#   4. Set secrets:
+#        wrangler secret put TELEGRAM_BOT_TOKEN
+#        wrangler secret put ALLOWED_TELEGRAM_USER_ID
+#        wrangler secret put GH_PAT_TOKEN
+#        wrangler secret put GITHUB_REPO_OWNER
+#        wrangler secret put GITHUB_REPO_NAME
+#   5. Deploy:             wrangler deploy
+#   6. Point Telegram at the Worker URL (e.g.
+#      https://telegram-depth-anything-bot.<your-subdomain>.workers.dev/webhook):
+#        curl -s "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<WORKER_URL>"
+#
+# NOTE: account_id is intentionally omitted — it is read from the
+# CLOUDFLARE_ACCOUNT_ID env var so this file stays clean for the public repo.
+
+name = "telegram-depth-anything-bot"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+# KV namespace for the album buffer. Create with:
+#   wrangler kv namespace create ALBUM_BUFFER
+# Then paste the id below.
+[[kv_namespaces]]
+binding = "ALBUM_BUFFER"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Worker secrets (set via `wrangler secret put <NAME>`):
+#   TELEGRAM_BOT_TOKEN       — Telegram bot API token
+#   ALLOWED_TELEGRAM_USER_ID — numeric Telegram user id of the single allowed user
+#   GH_PAT_TOKEN             — GitHub classic PAT with repo scope
+#   GITHUB_REPO_OWNER        — e.g. your-github-username
+#   GITHUB_REPO_NAME         — e.g. telegram-depth-anything-bot

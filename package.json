@@ -1,16 +1,23 @@
 {
   "name": "telegram-depth-anything-bot",
-  "version": "1.1.0",
-  "description": "Serverless Telegram bot that runs Depth Anything V2 monocular depth estimation via GitHub Actions.",
+  "version": "2.0.0",
+  "description": "Cloudflare Worker + GitHub Actions bot that runs Depth Anything V2 monocular depth estimation on Telegram photos and albums.",
   "private": true,
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {},
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
   "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "kv:create": "wrangler kv namespace create ALBUM_BUFFER",
+    "kv:list": "wrangler kv namespace list",
+    "secret:put": "wrangler secret put",
+    "test": "node --test"
   }
 }

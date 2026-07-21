@@ -10,6 +10,11 @@ pnpm-lock.yaml
 .env.*.local
 .vercel/
 
+# Cloudflare Wrangler local state
+.wrangler/
+.dev.vars
+.dev.vars.*
+
 # Python
 __pycache__/
 *.py[cod]
