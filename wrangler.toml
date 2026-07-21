@@ -42,7 +42,7 @@ workers_dev = true
 # Then paste the id below.
 [[kv_namespaces]]
 binding = "ALBUM_BUFFER"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "e4b65e218bd946f389074153df060a42"
 
 # Worker secrets (set via `wrangler secret put <NAME>`):
 #   TELEGRAM_BOT_TOKEN       — Telegram bot API token

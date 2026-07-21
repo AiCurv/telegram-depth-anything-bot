@@ -68,9 +68,20 @@ const MODEL_LARGE = 'depth-anything/Depth-Anything-V2-Large-hf';
 // How long to wait after the LATEST photo of a media group before dispatching
 // the accumulated batch. Telegram sends album photos in quick succession
 // (typically <500ms apart), but we leave a healthy margin so slow networks
-// still get fully batched. 1500ms is short enough to feel responsive and long
+// still get fully batched. 2500ms is short enough to feel responsive and long
 // enough to catch a 10-photo album.
-const MEDIA_GROUP_BUFFER_MS = 1500;
+//
+// Note: this is the INITIAL debounce. The flush function also does a 3-try
+// re-check loop with 500ms pauses, because Cloudflare KV is eventually
+// consistent across colos — a sibling write may not be visible to a flush
+// running in a different colo for up to ~1-2 seconds.
+const MEDIA_GROUP_BUFFER_MS = 2500;
+
+// How many times the flush should re-check KV for additional photos before
+// giving up and dispatching whatever it has. Each retry is 500ms apart.
+// Total worst-case wait: MEDIA_GROUP_BUFFER_MS + FLUSH_RETRIES * 500ms.
+const FLUSH_RETRIES = 4;
+const FLUSH_RETRY_DELAY_MS = 500;
 
 // Hard ceiling on the number of photos in a single dispatch. Telegram's
 // sendMediaGroup API limits albums to 10 items; if a user somehow uploads
@@ -329,37 +340,95 @@ async function isAlreadyDispatched(env, mediaGroupId) {
  *   - immediately (in `ctx.waitUntil`) for single-photo messages, OR
  *   - after MEDIA_GROUP_BUFFER_MS (in `ctx.waitUntil`) for album messages.
  *
- * For albums: if the newest photo is less than MEDIA_GROUP_BUFFER_MS old, the
- * album is still receiving photos — no-op and let a later sibling's flush
- * handle it. This implements the "last-photo-flushes" pattern.
+ * Leader election by smallest message_id:
+ *   Each album POST schedules its own flush. To avoid N sibling flushes each
+ *   dispatching independently, only the photo with the SMALLEST message_id
+ *   in the album dispatches. All other siblings no-op.
+ *
+ *   Telegram delivers album photos in message_id order, so the smallest
+ *   message_id is the FIRST photo of the album. Its flush is the "leader".
+ *
+ * KV eventual consistency handling:
+ *   Cloudflare KV is eventually consistent across colos. When 4 album photos
+ *   arrive within ~100ms, they may land on different colos, and each colo's
+ *   KV read may not see writes from other colos for up to ~1-2 seconds.
+ *
+ *   The leader's flush does a retry loop: gather, wait, gather again. If the
+ *   count is still growing, keep retrying (up to FLUSH_RETRIES). When the
+ *   count is stable, dispatch whatever we have.
+ *
+ *   The sentinel key prevents double-dispatch if the leader crashes mid-flush
+ *   and a sibling's retry loop later sees a stable count.
+ *
+ * `myMessageId` is the message_id of the photo that triggered THIS flush.
+ * For single photos, it's the only photo's message_id (always the leader).
+ * For albums, the leader check is: am I the smallest message_id in the album?
  */
-async function flushAlbum(env, mediaGroupId, isAlbum) {
+async function flushAlbum(env, mediaGroupId, isAlbum, myMessageId) {
   // Check sentinel first — a sibling flush may have already dispatched.
   if (await isAlreadyDispatched(env, mediaGroupId)) {
-    console.log(`[flush] album ${mediaGroupId} already dispatched, skipping`);
+    console.log(`[flush] ${mediaGroupId} already dispatched, skipping`);
     return;
   }
 
-  const entries = await gatherAlbum(env, mediaGroupId);
+  let entries = await gatherAlbum(env, mediaGroupId);
   if (entries.length === 0) {
-    console.log(`[flush] album ${mediaGroupId} has no photos (already cleaned up)`);
+    console.log(`[flush] ${mediaGroupId} has no photos (already cleaned up)`);
     return;
   }
 
-  // For albums: check if the album is "quiet" (no new photos for
-  // MEDIA_GROUP_BUFFER_MS). If not, no-op — let a later sibling's flush
-  // handle it. This prevents premature dispatch when an early photo's
-  // 1500ms timer fires while later photos are still arriving.
+  // Leader election: only the photo with the smallest message_id dispatches.
+  // This guarantees exactly ONE dispatch per album, regardless of how many
+  // sibling flushes fire or which colo they run on.
   if (isAlbum) {
-    const newestTs = Math.max(...entries.map((e) => e.metadata.receivedAt));
-    const quietFor = Date.now() - newestTs;
-    if (quietFor < MEDIA_GROUP_BUFFER_MS) {
+    const minMessageId = Math.min(...entries.map((e) => e.metadata.messageId));
+    if (myMessageId !== minMessageId) {
       console.log(
-        `[flush] album ${mediaGroupId} still receiving photos ` +
-        `(quiet for ${quietFor}ms < ${MEDIA_GROUP_BUFFER_MS}ms), deferring`
+        `[flush] ${mediaGroupId} I am msg ${myMessageId}, leader is msg ${minMessageId}, deferring`
       );
       return;
     }
+    console.log(`[flush] ${mediaGroupId} I am the leader (msg ${myMessageId})`);
+  }
+
+  // Retry loop: re-gather a few times to let KV propagate sibling writes.
+  // This is the critical fix for KV eventual consistency — without it, the
+  // leader might dispatch with only 1-2 photos even though 4 were sent,
+  // because the sibling writes haven't propagated to the leader's colo yet.
+  let lastCount = entries.length;
+  for (let attempt = 1; attempt <= FLUSH_RETRIES; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, FLUSH_RETRY_DELAY_MS));
+
+    // Re-check sentinel — a sibling may have dispatched while we waited.
+    if (await isAlreadyDispatched(env, mediaGroupId)) {
+      console.log(`[flush] ${mediaGroupId} dispatched by sibling during retry ${attempt}`);
+      return;
+    }
+
+    const reEntries = await gatherAlbum(env, mediaGroupId);
+    if (reEntries.length === 0) {
+      console.log(`[flush] ${mediaGroupId} cleaned up during retry ${attempt}`);
+      return;
+    }
+
+    if (reEntries.length > lastCount) {
+      console.log(
+        `[flush] ${mediaGroupId} retry ${attempt}: ` +
+        `count grew ${lastCount} -> ${reEntries.length}, continuing`
+      );
+      entries = reEntries;
+      lastCount = reEntries.length;
+      continue;
+    }
+
+    // Count is stable — KV has propagated. Use these entries.
+    if (reEntries.length !== entries.length) {
+      entries = reEntries;
+    }
+    console.log(
+      `[flush] ${mediaGroupId} retry ${attempt}: count stable at ${reEntries.length}, dispatching`
+    );
+    break;
   }
 
   // Cap at MAX_PHOTOS_PER_BATCH defensively. Telegram's UI already limits
@@ -544,11 +613,12 @@ export default {
       ctx.waitUntil(
         (async () => {
           // Wait MEDIA_GROUP_BUFFER_MS so siblings can land in KV. The flush
-          // function will check whether the album is "quiet" — if more photos
-          // arrive after us, our flush no-ops and the later sibling handles it.
+          // function will use leader election (smallest message_id) to ensure
+          // exactly ONE dispatch per album, regardless of how many sibling
+          // flushes fire or which colo they run on.
           await new Promise((resolve) => setTimeout(resolve, MEDIA_GROUP_BUFFER_MS));
           try {
-            await flushAlbum(env, mediaGroupId, true);
+            await flushAlbum(env, mediaGroupId, true, message.message_id);
           } catch (err) {
             console.error('[waitUntil] album flush threw:', err);
           }
@@ -588,7 +658,7 @@ export default {
     ctx.waitUntil(
       (async () => {
         try {
-          await flushAlbum(env, singleKey, false);
+          await flushAlbum(env, singleKey, false, message.message_id);
         } catch (err) {
           console.error('[waitUntil] single flush threw:', err);
         }
