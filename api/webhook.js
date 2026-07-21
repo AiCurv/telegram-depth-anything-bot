@@ -245,16 +245,35 @@ async function flushAlbum(key, isAlbum) {
 }
 
 /**
- * Add a photo to the album buffer and (re)schedule the flush.
+ * Add a photo to the album buffer.
  *
- * For album messages (media_group_id present), the first photo schedules a
- * flush after MEDIA_GROUP_BUFFER_MS. Subsequent photos in the same group
- * just append to the array — they do NOT reset the timer, because we want
- * the dispatch to fire on a fixed cadence regardless of how long the album
- * takes to arrive.
+ * Returns one of:
+ *   - { role: 'flusher', key, isAlbum: true, count }
+ *       This is the FIRST photo of an album. The caller MUST await
+ *       MEDIA_GROUP_BUFFER_MS and then call flushAlbum(key, true). The
+ *       caller's HTTP response should be sent AFTER that flush completes,
+ *       so Vercel keeps the function alive long enough for the dispatch.
+ *   - { role: 'flusher', key, isAlbum: false, count: 1 }
+ *       This is a single (non-album) photo. The caller should flush
+ *       immediately (no wait) — i.e. call flushAlbum(key, false) and await
+ *       it before responding.
+ *   - { role: 'appended', key, isAlbum: true, count }
+ *       This photo was appended to an existing album buffer (a sibling got
+ *       there first). The caller should respond immediately; the sibling's
+ *       request is responsible for flushing.
  *
- * For single-photo messages (no media_group_id), we use a synthetic key and
- * flush immediately (no timer).
+ * Design rationale:
+ *   Vercel serverless functions terminate the Node process when the HTTP
+ *   response is sent. Background setTimeout / setImmediate callbacks are
+ *   NOT guaranteed to fire. Therefore the request that creates the buffer
+ *   entry must STAY ALIVE until the flush completes — that means awaiting
+ *   the debounce window AND the GitHub dispatch, then responding.
+ *
+ *   For albums, Telegram sends all photos within ~500ms, so the first
+ *   photo's request is still in flight (holding the buffer open) when
+ *   siblings arrive. Siblings append to the shared in-memory buffer and
+ *   respond immediately. When the first photo's debounce timer fires, it
+ *   sees all accumulated photos and dispatches once.
  */
 function bufferMediaGroup({
   mediaGroupId, chatId, messageId, fileId, caption,
@@ -264,7 +283,10 @@ function bufferMediaGroup({
   const key = isAlbum ? mediaGroupId : `single:${chatId}:${messageId}`;
 
   let entry = albumBuffer.get(key);
+  let role;
+
   if (!entry) {
+    // New buffer entry — we are the flusher.
     entry = {
       chatId,
       messageId,
@@ -274,9 +296,12 @@ function bufferMediaGroup({
       modelLabel,
       cmap,
       cmapLabel,
-      timer: null,
     };
     albumBuffer.set(key, entry);
+    role = 'flusher';
+  } else {
+    // Existing entry — a sibling photo already started the debounce window.
+    role = 'appended';
   }
 
   // Cap at MAX_PHOTOS_PER_BATCH; ignore overflow defensively. Telegram's UI
@@ -287,29 +312,7 @@ function bufferMediaGroup({
     entry.captions.push(caption || '');
   }
 
-  // Schedule flush only if this is the first photo of the entry.
-  if (!entry.timer) {
-    if (isAlbum) {
-      // Album: wait for siblings to accumulate.
-      entry.timer = setTimeout(() => {
-        // Don't await — fire-and-forget so the timer callback returns immediately.
-        flushAlbum(key, true).catch((err) =>
-          console.error(`[flush] unhandled error for album ${key}:`, err)
-        );
-      }, MEDIA_GROUP_BUFFER_MS);
-    } else {
-      // Single photo: dispatch immediately (next tick, so the HTTP response
-      // goes out first). Using setImmediate keeps the latency floor at 0.
-      entry.timer = 'immediate';
-      setImmediate(() => {
-        flushAlbum(key, false).catch((err) =>
-          console.error(`[flush] unhandled error for single ${key}:`, err)
-        );
-      });
-    }
-  }
-
-  return { buffered: true, isAlbum, key, count: entry.photoIds.length };
+  return { role, key, isAlbum, count: entry.photoIds.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -373,9 +376,6 @@ export default async function handler(req, res) {
   }
 
   // ---- 4. Buffer the photo (album-aware) -----------------------------------
-  // If this is part of a media group, it will be queued with a 1500ms debounce
-  // so all sibling photos land before we dispatch. Single photos dispatch
-  // immediately on the next tick.
   const mediaGroupId = message.media_group_id || null;
   const bufferResult = bufferMediaGroup({
     mediaGroupId,
@@ -389,14 +389,42 @@ export default async function handler(req, res) {
     cmapLabel,
   });
 
-  // ---- 5. Acknowledge immediately -----------------------------------------
-  // We return 200 BEFORE the dispatch fires — the buffer's setTimeout / setImmediate
-  // ensures the dispatch happens after this response is sent. Telegram is happy
-  // because it sees 200 within milliseconds, and the actual GitHub dispatch
-  // happens in the background.
+  if (bufferResult.role === 'appended') {
+    // A sibling photo is already holding the buffer open and will flush.
+    // Respond immediately so Telegram doesn't retry this update.
+    return res.status(200).json({
+      ok: true,
+      buffered: true,
+      role: 'appended',
+      is_album: true,
+      photo_count_in_batch: bufferResult.count,
+      model,
+      cmap,
+    });
+  }
+
+  // ---- 5. We are the flusher -----------------------------------------------
+  // For albums: wait MEDIA_GROUP_BUFFER_MS so sibling photos can append.
+  // For single photos: flush immediately (no wait).
+  // Then await flushAlbum() — which fires the GitHub dispatch and notifies
+  // the user — BEFORE responding, so Vercel keeps the function alive long
+  // enough for the dispatch to actually complete.
+  if (bufferResult.isAlbum) {
+    await new Promise((resolve) => setTimeout(resolve, MEDIA_GROUP_BUFFER_MS));
+  }
+
+  try {
+    await flushAlbum(bufferResult.key, bufferResult.isAlbum);
+  } catch (err) {
+    console.error('[handler] flushAlbum threw:', err);
+    // Don't fail the HTTP response — Telegram would retry. The flushAlbum
+    // helper already notified the user of the failure via Telegram.
+  }
+
   return res.status(200).json({
     ok: true,
     buffered: true,
+    role: 'flusher',
     is_album: bufferResult.isAlbum,
     photo_count_in_batch: bufferResult.count,
     model,
