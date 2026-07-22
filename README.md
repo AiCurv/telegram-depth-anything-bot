@@ -3,25 +3,33 @@
 A single-user Telegram bot that runs **Depth Anything V2** monocular depth estimation on any photo (or album of up to 10) you send it. Heavy compute is offloaded to GitHub Actions (free unlimited minutes on public repos), while a Cloudflare Worker + KV acts as the firewall, album buffer, and dispatcher.
 
 ```
-Telegram photo ──▶ Cloudflare Worker (200ms) ──▶ repository_dispatch ──▶ GitHub Actions runner
-                       │                                                  │
-                       │                                                  ├─ pulls HF weights (cached)
-                       │                                                  ├─ runs Depth Anything V2
-                       │                                                  └─ sendPhoto / sendMediaGroup back to chat
+Telegram photo ──▶ Cloudflare Worker (200ms) ──▶ inline keyboard with 2 buttons
+                       │                                  │
+                       │                                  └─ user taps 🎨 HD Color or 🏁 HD Grayscale
+                       │                                       │
+                       │                                       └─ callback_query ──▶ Worker
+                       │                                              │
+                       │                                              ├─ answerCallbackQuery (instant, kills spinner)
+                       │                                              ├─ editMessageText ("⏳ Generating...")
+                       │                                              └─ repository_dispatch ──▶ GitHub Actions runner
+                       │                                                                          │
+                       │                                                                          ├─ pulls HF weights (cached)
+                       │                                                                          ├─ runs Depth Anything V2 Large
+                       │                                                                          └─ sendPhoto / sendMediaGroup back to chat
                        │
                        ├─ user locked via ALLOWED_TELEGRAM_USER_ID
-                       └─ KV buffers album photos for 1500ms → ONE dispatch per album
+                       └─ KV buffers album photos for 2500ms → ONE inline keyboard per album
 ```
 
 ## Architecture
 
 | Layer | Tech | Role |
 |------|------|------|
-| Edge | Cloudflare Worker (`src/worker.js`) | Auth firewall + KV album buffer + dispatcher. Returns HTTP 200 within ~200ms. |
-| State | Cloudflare KV (`ALBUM_BUFFER` namespace) | Per-photo keys + 1500ms debounce → single dispatch per album regardless of which colo handled each photo. |
+| Edge | Cloudflare Worker (`src/worker.js`) | Auth firewall + KV album buffer + inline keyboard dispatcher. Returns HTTP 200 within ~200ms. |
+| State | Cloudflare KV (`ALBUM_BUFFER` namespace) | Per-photo keys (album buffer) + `session:{chat_id}:{msg_id}` keys (10-min TTL, hold photo_ids for callback retrieval). |
 | Queue | GitHub `repository_dispatch` API | Decouples webhook from compute. Survives retries. |
 | Compute | GitHub Actions (`ubuntu-latest`) | Pulls HF weights, runs inference (model loaded once per album), replies via Telegram Bot API. |
-| ML | Hugging Face `transformers` pipeline | Depth Anything V2 Small (`/fast`) or Large (`/hd`, default). |
+| ML | Hugging Face `transformers` pipeline | Depth Anything V2 **Large** (hardcoded — Small retired). |
 
 ### Why this shape
 
@@ -111,10 +119,13 @@ Then in **Settings → Secrets and variables → Actions**, add:
 
 ### 4. Wire Telegram to the Worker
 
+The webhook must allow BOTH `message` and `callback_query` updates — the
+latter is what Telegram sends when the user taps an inline keyboard button.
+
 ```bash
 curl "https://api.telegram.org/bot<TOKEN>/setWebhook" \
      -d "url=https://<your-worker>.workers.dev/" \
-     -d "allowed_updates=%5B%22message%22%5D"
+     -d "allowed_updates=%5B%22message%22%2C%22callback_query%22%5D"
 ```
 
 Verify:
@@ -127,51 +138,51 @@ You should see `"url": "https://<your-worker>.workers.dev/"` and `"pending_updat
 
 ### 5. Send a photo
 
-Send a photo to your bot with caption `/hd` (large model, ~1–3 min) or `/fast` (small model, ~30–60s). You can combine model and color flags, e.g. `/fast /color` or `/hd /gray`. With no flags you get **HD + grayscale** by default.
+Send a photo (or album of up to 10) to the bot. Within ~3 seconds the bot replies with two inline buttons:
+
+- 🎨 **HD Color** — inferno colormap (warm = near, cool = far)
+- 🏁 **HD Grayscale** — pure 0–255 grayscale
+
+Tap one. The button spinner disappears instantly (the Worker calls `answerCallbackQuery` as line 1 of its callback handler), the button card updates to `⏳ Generating HD Depth Map...`, and ~1–3 minutes later the depth map arrives as a reply.
 
 ## Albums
 
-Send multiple photos as a single Telegram album and the bot will batch-process them. The Cloudflare Worker buffers album photos (sharing the same `media_group_id`) in KV for 1500ms, then fires a SINGLE GitHub Actions dispatch containing all `photo_ids`. The Python runner loads the model ONCE, runs inference on every photo, and replies with a single album via `sendMediaGroup`.
+Send multiple photos as a single Telegram album and the bot will batch-process them. The Cloudflare Worker buffers album photos (sharing the same `media_group_id`) in KV for 2500ms, then the leader (smallest message_id) writes a single session entry to KV and shows ONE inline keyboard for the whole album. When you tap a color button, all photos in the album are processed in one GitHub Actions run, and the result comes back as a single `sendMediaGroup` album reply.
 
-**How KV buffering works:** each album POST writes its photo to a unique KV key (`album:{media_group_id}:{message_id}`) with photo metadata in KV's inline metadata field. Each POST also schedules `ctx.waitUntil(flush at t+1500ms)`. The flush checks whether the album has been "quiet" for ≥1500ms (no new photos) — only the LAST photo's flush passes this check and dispatches. Earlier flushes no-op. A sentinel key (`album:{id}:dispatched`) suppresses any double-dispatch race.
+**How KV buffering works:** each album POST writes its photo to a unique KV key (`album:{media_group_id}:{message_id}`) with photo metadata in KV's inline metadata field. Each POST also schedules `ctx.waitUntil(flush at t+2500ms)`. The flush elects a leader (smallest message_id) — only the leader proceeds. The leader does a 4-try re-gather loop (500ms apart) to wait for KV eventual consistency across colos, then writes the consolidated session (`session:{chat_id}:{first_msg_id}`, 10-min TTL) and sends the inline keyboard. A sentinel key (`album:{id}:flushed`) suppresses double-flush if a sibling's retry loop sees a stable count later.
 
-**Limitations:** KV is eventually consistent across Cloudflare colos, so in the rare case that album photos land on different colos, a sibling's write might not yet be visible when the flush fires. The orphaned photo's KV key auto-expires after 5 minutes. For bulletproof cross-colo batching, use Durable Objects (requires Workers Paid plan, $5/mo).
+**Why answerCallbackQuery must be line 1 of the callback handler:** Telegram's client shows a small loading spinner on the tapped inline keyboard button. The spinner auto-stops when `answerCallbackQuery` is received OR after ~10 seconds (whichever comes first). If the Worker does any slow work first (KV read, GitHub dispatch), the user sees the spinner for the full 10s, which feels broken. Calling `answerCallbackQuery` as the first HTTP call kills the spinner in <100ms.
+
+**Limitations:** KV is eventually consistent across Cloudflare colos, so in the rare case that album photos land on different colos, a sibling's write might not yet be visible when the flush fires. The leader's retry loop handles this. Orphaned KV keys auto-expire after 5 minutes. For bulletproof cross-colo batching, use Durable Objects (requires Workers Paid plan, $5/mo).
 
 ## Usage
 
-Flags can be combined in any order in a photo caption (or sent as a standalone text command before uploading).
+No more caption flags. Send a photo (or album), tap a button. That's it.
 
-### Model flags
+### The flow
 
-| Flag | Model |
-|------|-------|
-| `/hd` or `hd` | Depth Anything V2 **Large** (default) |
-| `/fast` or `fast` | Depth Anything V2 **Small** |
+1. **Send a photo or album.** No caption needed.
+2. **The bot replies with an inline keyboard** containing two buttons:
+   - 🎨 **HD Color** — inferno colormap
+   - 🏁 **HD Grayscale** — pure 0–255 grayscale PNG
+3. **Tap a button.** The spinner disappears instantly. The button card updates to `⏳ Generating HD Depth Map...`.
+4. **Wait ~1–3 minutes.** The depth map (or album of depth maps) arrives as a reply.
 
-### Color flags
+### What happened to /hd /fast /gray /color?
 
-| Flag | Output |
-|------|--------|
-| `/gray`, `/grayscale`, or `gray` | Pure 0–255 grayscale PNG (default) |
-| `/color`, `/inferno`, or `color` | Inferno-colormapped PNG |
+The caption-flag parser has been removed. The model is **always** `Depth-Anything-V2-Large-hf` (the Small model has been retired — it wasn't worth the quality tradeoff for the speed savings on a single-user bot). Color is chosen via the inline keyboard buttons, which is faster and less error-prone than typing flags.
 
-### Examples
+### /start and /help
 
-| Caption | Result |
-|---------|--------|
-| *(no caption)* | HD + grayscale |
-| `/fast` | Small + grayscale |
-| `/hd /color` | Large + inferno colormap |
-| `/fast /gray` | Small + grayscale |
-| `hd color` | Large + inferno (slashes optional) |
-| `/color` | Large + inferno (model defaults to HD) |
-| `/start` | Greeting + usage. |
-| `/help`  | Usage summary. |
+These still work and describe the new button-based flow.
 
 ## Models
 
-- **Small**: [`depth-anything/Depth-Anything-V2-Small-hf`](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf) — 25M params, ~3s inference on CPU.
-- **Large**: [`depth-anything/Depth-Anything-V2-Large-hf`](https://huggingface.co/depth-anything/Depth-Anything-V2-Large-hf) — 335M params, ~10–20s inference on CPU.
+Only one model is in use:
+
+- **Large**: [`depth-anything/Depth-Anything-V2-Large-hf`](https://huggingface.co/depth-anything/Depth-Anything-V2-Large-hf) — 335M params, ~10–20s inference on CPU. Hardcoded in `scripts/process_depth.py` and `src/worker.js`.
+
+The Small model (25M params, ~3s inference) has been retired. The speed savings weren't worth the quality tradeoff for a single-user bot, and removing it simplified the UI to two buttons instead of four.
 
 ## Security notes
 
@@ -201,9 +212,11 @@ Total: $0/mo for the configured single-user workload.
 
 ## Troubleshooting
 
-- **Bot doesn't reply at all.** Check `getWebhookInfo` — if `last_error_message` is set, the Worker is throwing. Tail Worker logs with `wrangler tail`.
-- **Bot says "Queued" but never delivers the depth map.** Check the Actions tab in GitHub — the workflow run is likely red. Open the log; 99% of the time it's a missing `TELEGRAM_BOT_TOKEN` secret or a HF download timeout (re-run the job, the cache will speed it up the second time).
-- **Album came back as individual photos instead of one album.** This means the KV buffer didn't gather all siblings — check `wrangler tail` for `[flush] album ... still receiving photos` messages. Could be a KV eventual-consistency delay across colos; for a guaranteed fix, upgrade to Workers Paid and use Durable Objects.
+- **Bot doesn't reply at all.** Check `getWebhookInfo` — if `last_error_message` is set, the Worker is throwing. Tail Worker logs with `wrangler tail`. Also verify that `allowed_updates` includes BOTH `message` and `callback_query` (the inline keyboard taps won't reach the Worker otherwise).
+- **Button tap shows a 10-second spinner before anything happens.** This means `answerCallbackQuery` is not being called first in the callback handler. Check `wrangler tail` for `[callback]` log lines — the handler should call `answerCallbackQuery` before any KV read or GitHub dispatch. The current code does this correctly; if you see this symptom, you may be running an older deploy.
+- **Bot says "Queued" / "⏳ Generating..." but never delivers the depth map.** Check the Actions tab in GitHub — the workflow run is likely red. Open the log; 99% of the time it's a missing `TELEGRAM_BOT_TOKEN` secret or a HF download timeout (re-run the job, the cache will speed it up the second time).
+- **Album came back as individual photos instead of one album.** This means the KV buffer didn't gather all siblings — check `wrangler tail` for `[flush] album ...` messages. Could be a KV eventual-consistency delay across colos; for a guaranteed fix, upgrade to Workers Paid and use Durable Objects.
+- **Button says "This button expired."** The session entry (10-min TTL) expired before you tapped. Send the photo(s) again to get a fresh inline keyboard.
 - **Stranger sent a photo and burned my Actions minutes.** They can't — the Worker firewall drops them with HTTP 200 before the dispatch fires. Verify `ALLOWED_TELEGRAM_USER_ID` is your numeric ID, not your `@username`.
 - **Cold cache takes forever.** First run after cache invalidation downloads ~1.5GB for the Large model. Subsequent runs use the cache and boot in <2 min.
 
