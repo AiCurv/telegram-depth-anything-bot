@@ -42,8 +42,10 @@ import matplotlib
 matplotlib.use("Agg")  # headless
 import numpy as np
 import requests
+import torch
+import torch.nn.functional as F
 from PIL import Image
-from transformers import pipeline
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 # ---------------------------------------------------------------------------
 # Telegram API glue
@@ -314,32 +316,90 @@ def run_batch_inference(image_paths: List[str], model_name: str, cmap: str,
                         workdir: str) -> List[Tuple[str, float, float]]:
     """Load the model once and run inference across all images in the batch.
 
+    Bypasses `transformers.pipeline("depth-estimation")` entirely. The pipeline
+    post-processes raw depth with `(depth * 255 / np.max(depth)).astype("uint8")`,
+    which (a) divides by `max` instead of `(max - min)` so negative depth values
+    get clipped to zero, and (b) quantizes to uint8 BEFORE downstream code can
+    do per-image min-max normalization. The result is salt-and-pepper noise in
+    dark regions and crushed mid-tones — exactly the artifacts we were seeing
+    vs. the Hugging Face Space.
+
+    Native path (matches the official HF Space for Depth Anything V2):
+      1. processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+         model     = AutoModelForDepthEstimation.from_pretrained(MODEL_NAME)
+      2. inputs = processor(images=image, return_tensors="pt")
+      3. outputs = model(**inputs)  # no_grad
+      4. predicted_depth = outputs.predicted_depth           # raw float32 tensor
+      5. resize to (H, W) of the ORIGINAL input image via
+         torch.nn.functional.interpolate(..., mode="bicubic", align_corners=False)
+      6. depth_arr = prediction.squeeze().cpu().numpy()      # float32, unquantized
+
+    render_depth_map then applies strict per-image min-max normalization on
+    the unquantized float32 tensor — exactly what the HF Space does.
+
     Returns a list of (output_png_path, min_depth, max_depth) tuples for each
     successfully processed image. Failed images are logged and skipped.
     """
-    print(f"[infer] loading model: {model_name}  (cmap={cmap})  batch_size={len(image_paths)}")
+    print(f"[infer] loading model (native): {model_name}  (cmap={cmap})  batch_size={len(image_paths)}")
     t0 = time.time()
 
     # CPU-only runner; GitHub ubuntu-latest has no GPU.
-    pipe = pipeline(
-        task="depth-estimation",
-        model=model_name,
-        device="cpu",
-    )
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = AutoModelForDepthEstimation.from_pretrained(model_name)
+    model.to("cpu").eval()
     print(f"[infer] model loaded in {time.time() - t0:.1f}s")
 
     results: List[Tuple[str, float, float]] = []
     for idx, image_path in enumerate(image_paths, start=1):
         try:
             image = Image.open(image_path).convert("RGB")
-            print(f"[infer] photo #{idx}/{len(image_paths)}: {image.size[0]}x{image.size[1]}")
+            src_w, src_h = image.size  # PIL: (width, height)
+            print(f"[infer] photo #{idx}/{len(image_paths)}: {src_w}x{src_h}")
 
             t1 = time.time()
-            result = pipe(image)
-            print(f"[infer]   inference took {time.time() - t1:.1f}s")
 
-            depth_pil = result["depth"]
-            depth_arr = np.array(depth_pil).astype(np.float32)
+            # --- Native inference, bypassing the pipeline post-processing ---
+            inputs = processor(images=image, return_tensors="pt")
+            inputs = {k: v.to("cpu") for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+
+            # Raw predicted_depth tensor. Shape is model-dependent; Depth
+            # Anything V2 Large emits (B, 1, H/14, W/14). Normalize to exactly
+            # 4D (B, C, H, W) before F.interpolate, which requires 4D input.
+            predicted_depth = outputs.predicted_depth
+            if predicted_depth.dim() == 3:
+                # (B, H, W) -> (B, 1, H, W)
+                predicted_depth = predicted_depth.unsqueeze(1)
+            elif predicted_depth.dim() == 4 and predicted_depth.shape[1] != 1:
+                # Multi-channel output — average across channels to a single
+                # depth channel. Defensive; shouldn't trigger for DA-V2.
+                predicted_depth = predicted_depth.mean(dim=1, keepdim=True)
+
+            # Resize the low-res model output back to the ORIGINAL image
+            # dimensions using bicubic interpolation. This matches the HF Space
+            # pipeline exactly. align_corners=False is the standard choice for
+            # continuous-valued tensors like depth maps.
+            prediction = F.interpolate(
+                predicted_depth,
+                size=(src_h, src_w),  # (H, W) ordering
+                mode="bicubic",
+                align_corners=False,
+            )
+
+            # Squeeze batch (B=1) and channel (C=1) dims -> (H, W) float32
+            # tensor on CPU as a numpy array. NO clipping, NO quantization.
+            depth_arr = (
+                prediction.squeeze()
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+            print(f"[infer]   inference took {time.time() - t1:.1f}s  "
+                  f"raw depth: min={float(depth_arr.min()):.4f}  "
+                  f"max={float(depth_arr.max()):.4f}  shape={depth_arr.shape}")
 
             out_path = os.path.join(workdir, f"depth_{idx:02d}.png")
             dmin, dmax = render_depth_map(depth_arr, image, cmap, out_path)
