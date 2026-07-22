@@ -2,16 +2,28 @@
  * src/worker.js
  *
  * Cloudflare Worker that:
- *   1. Receives Telegram webhook payloads.
+ *   1. Receives Telegram webhook payloads (messages AND callback_query events).
  *   2. Validates the sender against ALLOWED_TELEGRAM_USER_ID (single-user whitelist).
  *   3. Silently drops anyone else with HTTP 200 (so the bot cannot be probed).
- *   4. Buffers photos that share a `media_group_id` into Cloudflare KV with a
- *      1500ms debounce window, then fires a SINGLE GitHub dispatch containing
- *      all file_ids — so an album of N photos triggers ONE Actions run, not N.
- *   5. Single photos (no media_group_id) are dispatched immediately.
- *   6. Replies instantly with HTTP 200 to avoid Telegram webhook timeouts;
- *      the actual GitHub dispatch happens in `ctx.waitUntil` after the
- *      debounce window.
+ *   4. When photo(s) arrive:
+ *      a. If album (media_group_id present): buffers photo file_ids in KV per
+ *         photo key under `album:{media_group_id}:{message_id}` with a 2500ms
+ *         debounce, then the leader (smallest message_id) flushes.
+ *      b. If single photo: skips the debounce.
+ *      c. After flush: writes a SESSION entry under `session:{chat_id}:{first_message_id}`
+ *         (10-minute TTL) containing all file_ids, then sends a sendMessage
+ *         with an INLINE KEYBOARD offering two buttons:
+ *           - "🎨 HD Color"     callback_data=`process:inferno:{first_message_id}`
+ *           - "🏁 HD Grayscale" callback_data=`process:gray:{first_message_id}`
+ *   5. When `callback_query` arrives (user tapped a button):
+ *      STEP 1 (IMMEDIATE, INLINE): Call answerCallbackQuery to dismiss the
+ *              Telegram button loading spinner. This MUST be the first HTTP
+ *              call — Telegram shows a 10s spinner otherwise.
+ *      STEP 2 (INLINE): editMessageText on the inline keyboard message to
+ *              show "⏳ Generating HD Depth Map...".
+ *      STEP 3 (in ctx.waitUntil): Read the session from KV, fire
+ *              repository_dispatch to GitHub Actions with
+ *              model=Depth-Anything-V2-Large-hf and cmap (inferno|gray).
  *
  * Why KV instead of in-memory?
  *   Vercel serverless functions (the previous architecture) do not share
@@ -30,17 +42,18 @@
  *   path uses `list({ prefix })` to gather all siblings atomically.
  *
  * Last-photo-flushes pattern:
- *   Each album POST schedules `ctx.waitUntil(flush at t+1500ms)`. The flush
- *   reads all photos for this album and checks: "has the album been quiet for
- *   ≥1500ms?" (i.e. is the newest photo's timestamp older than 1500ms?). If
- *   yes, dispatch and delete keys. If no, no-op — a later sibling's flush
- *   will handle it. The LAST photo's flush is the one that actually dispatches.
+ *   Each album POST schedules `ctx.waitUntil(flush at t+2500ms)`. The flush
+ *   reads all photos for this album and elects a leader (smallest message_id).
+ *   Only the leader dispatches. The sentinel key (`album:{id}:dispatched`)
+ *   suppresses double-dispatch if a sibling's flush fires after the leader.
  *
- *   Edge case: if the last photo's Worker invocation dies before its flush
- *   fires, no dispatch happens. Orphaned KV keys auto-expire after KV_TTL_S
- *   (5 minutes). The user will notice no reply and resend — acceptable for a
- *   single-user bot. To make this bulletproof, use Durable Objects (requires
- *   Workers Paid plan, $5/month).
+ * Why answerCallbackQuery MUST be the first HTTP call?
+ *   Telegram's client shows a small loading spinner on the tapped inline
+ *   keyboard button. The spinner auto-stops when answerCallbackQuery is
+ *   received OR after ~10 seconds (whichever comes first). If the Worker
+ *   does any slow work first (KV read, GitHub dispatch), the user sees the
+ *   spinner for the full 10s, which feels broken. Calling answerCallbackQuery
+ *   as line 1 of the callback handler kills the spinner in <100ms.
  *
  * Security model:
  *   - All secrets live in Cloudflare Worker secrets; NONE are in the repo.
@@ -49,101 +62,64 @@
  *     the dispatch event requires GH_PAT_TOKEN so a stranger cannot fire it
  *     directly through GitHub's API.
  *
- * Command parsing:
- *   Flags can appear in message.text OR message.caption, in any order, with or
- *   without the leading slash. Examples that all work:
- *     `/hd /color`   `/fast /gray`   `hd color`   `/color`   `gray`
- *   Defaults when no flag is given:
- *     model = Depth-Anything-V2-Large-hf  (/hd)
- *     cmap  = gray                        (pure 0-255 grayscale)
+ * Model:
+ *   Hardcoded to depth-anything/Depth-Anything-V2-Large-hf. The Small model
+ *   has been retired from the entire pipeline. The user no longer types
+ *   /hd or /fast — every run is HD. Color (inferno|gray) is chosen via the
+ *   inline keyboard buttons.
  */
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const MODEL_SMALL = 'depth-anything/Depth-Anything-V2-Small-hf';
 const MODEL_LARGE = 'depth-anything/Depth-Anything-V2-Large-hf';
 
-// How long to wait after the LATEST photo of a media group before dispatching
+// How long to wait after the LATEST photo of a media group before flushing
 // the accumulated batch. Telegram sends album photos in quick succession
 // (typically <500ms apart), but we leave a healthy margin so slow networks
 // still get fully batched. 2500ms is short enough to feel responsive and long
 // enough to catch a 10-photo album.
 //
-// Note: this is the INITIAL debounce. The flush function also does a 3-try
+// Note: this is the INITIAL debounce. The flush function also does a 4-try
 // re-check loop with 500ms pauses, because Cloudflare KV is eventually
 // consistent across colos — a sibling write may not be visible to a flush
 // running in a different colo for up to ~1-2 seconds.
 const MEDIA_GROUP_BUFFER_MS = 2500;
 
 // How many times the flush should re-check KV for additional photos before
-// giving up and dispatching whatever it has. Each retry is 500ms apart.
+// giving up and flushing whatever it has. Each retry is 500ms apart.
 // Total worst-case wait: MEDIA_GROUP_BUFFER_MS + FLUSH_RETRIES * 500ms.
 const FLUSH_RETRIES = 4;
 const FLUSH_RETRY_DELAY_MS = 500;
 
-// Hard ceiling on the number of photos in a single dispatch. Telegram's
+// Hard ceiling on the number of photos in a single session. Telegram's
 // sendMediaGroup API limits albums to 10 items; if a user somehow uploads
 // more (Telegram shouldn't allow it, but defensive), we cap here.
 const MAX_PHOTOS_PER_BATCH = 10;
 
-// KV key TTL — orphaned album buffers auto-expire after this many seconds.
-// 5 minutes is long enough that even a slow album delivery completes well
-// within the window, and short enough that orphans don't accumulate.
-const KV_TTL_S = 300;
-
-// Sentinel key TTL — once an album has been dispatched, we set a short-lived
-// sentinel to suppress duplicate dispatches from sibling flush timers that
-// fire slightly later. 60s is enough for all sibling timers to have fired.
+// KV key TTLs.
+//
+// KV_ALBUM_BUFFER_TTL_S: per-photo keys during album buffering. Short — the
+//   flush deletes them after dispatch, but if the leader crashes they auto-
+//   expire so orphans don't accumulate.
+//
+// SESSION_TTL_S: the session entry that the callback_query reads to fire the
+//   GitHub dispatch. Must be long enough that the user has time to tap a
+//   button. 10 minutes is generous — if they haven't tapped in 10 min, they
+//   probably never will, and the session expires cleanly.
+//
+// SENTINEL_TTL_S: marks an album as already-flushed so sibling flush timers
+//   no-op. 60s is enough for all sibling timers to have fired.
+const KV_ALBUM_BUFFER_TTL_S = 300;
+const SESSION_TTL_S = 600;
 const SENTINEL_TTL_S = 60;
-
-// ---------------------------------------------------------------------------
-// Command parser (identical to the previous Vercel webhook — same behavior,
-// same test suite passes)
-// ---------------------------------------------------------------------------
-
-/**
- * Parse the user-supplied text (from message.text or message.caption) into a
- * { model, modelLabel, cmap, cmapLabel } tuple.
- *
- * Rules (matches `/hd` or `hd` case-insensitively, with or without the slash):
- *   - Model:   /hd  -> Large (default if neither /hd nor /fast)
- *              /fast-> Small
- *   - Color:   /color, /inferno, or 'color' -> inferno colormap
- *              /gray, /grayscale, or 'gray' -> grayscale (default)
- *
- * The slash is optional so users can type either `/hd color` or `hd color`.
- * Each token must be a whole word — we look-behind for start-of-string or
- * whitespace, and look-ahead for whitespace or end-of-string, so substrings
- * like 'gray' inside 'graymatter' or 'fast' inside 'fastly' do NOT match.
- */
-function parseCommandPayload(rawText) {
-  // Pad with whitespace so the lookbehind/lookahead regexes can match at both
-  // ends of the string uniformly. Lowercase for case-insensitive matching.
-  const text = ` ${(rawText || '').toLowerCase()} `;
-
-  // ---- model ----
-  const wantsFast = /\s\/?fast\s/.test(text);
-  const wantsHd = /\s\/?hd\s/.test(text);
-  // If both /hd and /fast are present, /hd wins (HD is the better default and
-  // is also the documented default — explicit /hd is treated as an override).
-  const model = wantsHd || !wantsFast ? MODEL_LARGE : MODEL_SMALL;
-  const modelLabel = model === MODEL_LARGE ? 'HD' : 'fast';
-
-  // ---- color ----
-  const wantsColor = /\s\/?(color|inferno)\s/.test(text);
-  // Default to gray. If both /gray and /color are present, color wins as the
-  // deliberate override.
-  const cmap = wantsColor ? 'inferno' : 'gray';
-  const cmapLabel = cmap === 'inferno' ? 'inferno colormap' : 'grayscale';
-
-  return { model, modelLabel, cmap, cmapLabel };
-}
 
 // ---------------------------------------------------------------------------
 // Telegram + GitHub glue
 // ---------------------------------------------------------------------------
+
+const TG_API = (botToken) => `https://api.telegram.org/bot${botToken}`;
 
 /**
  * Send a short text message to a Telegram chat. Fire-and-forget, errors are
@@ -151,7 +127,7 @@ function parseCommandPayload(rawText) {
  */
 async function notifyTelegram(botToken, chatId, text) {
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    await fetch(`${TG_API(botToken)}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -163,6 +139,121 @@ async function notifyTelegram(botToken, chatId, text) {
     });
   } catch (e) {
     console.error('notifyTelegram failed:', e.message);
+  }
+}
+
+/**
+ * Send a sendMessage with an inline keyboard offering two color choices.
+ * Returns the sent message's message_id (so the caller can later edit it),
+ * or null if the send failed.
+ *
+ * The inline keyboard has TWO buttons in ONE row:
+ *   [🎨 HD Color] [🏁 HD Grayscale]
+ * Each button's callback_data encodes the chosen cmap and the first photo's
+ * message_id (used to look up the session in KV when the button is tapped).
+ *
+ * `photoMessageId` is the message_id of the FIRST photo in the album (or the
+ * only photo for single-photo uploads). It becomes the suffix of:
+ *   - the KV session key:   session:{chatId}:{photoMessageId}
+ *   - the callback_data:    process:{cmap}:{photoMessageId}
+ */
+async function sendInlineKeyboard(botToken, chatId, photoMessageId, isAlbum, photoCount) {
+  const label = isAlbum
+    ? `📸 Got your album of ${photoCount} photo${photoCount === 1 ? '' : 's'}.`
+    : '📸 Got your photo.';
+
+  const text =
+    `${label}\n\n` +
+    `Tap a button to generate an *HD depth map* with the chosen render:\n\n` +
+    `• *HD Color* — inferno colormap (warm = near, cool = far)\n` +
+    `• *HD Grayscale* — pure 0–255 grayscale\n\n` +
+    `Model: \`Depth-Anything-V2-Large-hf\``;
+
+  const inlineKeyboard = [
+    [
+      { text: '🎨 HD Color', callback_data: `process:inferno:${photoMessageId}` },
+      { text: '🏁 HD Grayscale', callback_data: `process:gray:${photoMessageId}` },
+    ],
+  ];
+
+  try {
+    const res = await fetch(`${TG_API(botToken)}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: inlineKeyboard },
+      }),
+    });
+    const body = await res.json();
+    if (!body.ok) {
+      console.error('sendInlineKeyboard failed:', body);
+      return null;
+    }
+    return body.result?.message_id ?? null;
+  } catch (e) {
+    console.error('sendInlineKeyboard threw:', e.message);
+    return null;
+  }
+}
+
+/**
+ * IMMEDIATELY answer a callback_query. This is the single most important call
+ * in the callback handler — it dismisses the Telegram button loading spinner
+ * within ~100ms. Without it, the spinner runs for the full 10s timeout and
+ * the bot feels broken.
+ *
+ * MUST be the FIRST HTTP call in the callback handler. Do not do KV reads,
+ * GitHub dispatches, or any other slow work before this.
+ *
+ * `text` is shown as a small toast at the top of the chat for ~2s.
+ */
+async function answerCallbackQuery(botToken, callbackQueryId, text) {
+  try {
+    await fetch(`${TG_API(botToken)}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callback_query_id: callbackQueryId,
+        text,
+      }),
+    });
+  } catch (e) {
+    // Don't throw — even if this fails, we want to proceed with the dispatch.
+    console.error('answerCallbackQuery failed:', e.message);
+  }
+}
+
+/**
+ * Edit the text (and optionally reply_markup) of an existing inline keyboard
+ * message. Used to swap the "tap a button" prompt for "⏳ Generating..." after
+ * the user taps.
+ */
+async function editMessageText(botToken, chatId, messageId, text, opts = {}) {
+  const body = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: opts.parse_mode || 'Markdown',
+    disable_web_page_preview: true,
+  };
+  // If a new inline_keyboard is provided, include it. Pass `null` to remove
+  // the keyboard entirely ( Telegram accepts reply_markup: undefined to leave
+  // it unchanged, or {inline_keyboard: []} to remove it).
+  if (opts.inline_keyboard !== undefined) {
+    body.reply_markup = { inline_keyboard: opts.inline_keyboard };
+  }
+  try {
+    await fetch(`${TG_API(botToken)}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    console.error('editMessageText failed:', e.message);
   }
 }
 
@@ -199,12 +290,14 @@ async function triggerGitHubAction(env, payload) {
 }
 
 // ---------------------------------------------------------------------------
-// KV album buffer
+// KV album buffer (per-photo keys, leader-elected flush)
 // ---------------------------------------------------------------------------
 //
-// Storage layout:
+// Storage layout (KV namespace ALBUM_BUFFER):
 //   album:{media_group_id}:{message_id}  -> value="", metadata={photo data}
 //   album:{media_group_id}:dispatched    -> value="1", short TTL
+//   session:{chat_id}:{first_message_id} -> value=JSON.stringify({photo_ids, ...}),
+//                                            10-minute TTL (used by callback_query)
 //
 // Each photo writes its OWN key, so there are no read-modify-write races and
 // no per-key write-rate-limit issues. The flush path uses `list({ prefix })`
@@ -215,17 +308,24 @@ async function triggerGitHubAction(env, payload) {
 // truncated caption), well within the limit.
 
 /**
- * Build the KV key for a single photo in an album.
+ * Build the KV key for a single photo in an album (or a single-photo "album").
  */
 function photoKey(mediaGroupId, messageId) {
   return `album:${mediaGroupId}:${messageId}`;
 }
 
 /**
- * Build the KV sentinel key that marks an album as already-dispatched.
+ * Build the KV sentinel key that marks an album as already-flushed.
  */
-function dispatchedSentinelKey(mediaGroupId) {
-  return `album:${mediaGroupId}:dispatched`;
+function flushedSentinelKey(mediaGroupId) {
+  return `album:${mediaGroupId}:flushed`;
+}
+
+/**
+ * Build the KV session key that the callback_query reads to fire the dispatch.
+ */
+function sessionKey(chatId, firstMessageId) {
+  return `session:${chatId}:${firstMessageId}`;
 }
 
 /**
@@ -238,8 +338,6 @@ function dispatchedSentinelKey(mediaGroupId) {
  * KV metadata is capped at 1024 bytes. We truncate the caption defensively.
  */
 async function writePhotoEntry(env, mediaGroupId, photo) {
-  // Truncate caption to keep metadata under the 1024-byte KV limit.
-  // file_id is typically ~80 chars; we leave ~600 chars for caption.
   const safeCaption = (photo.caption || '').slice(0, 600);
 
   const metadata = {
@@ -247,16 +345,12 @@ async function writePhotoEntry(env, mediaGroupId, photo) {
     messageId: photo.messageId,
     fileId: photo.fileId,
     caption: safeCaption,
-    model: photo.model,
-    modelLabel: photo.modelLabel,
-    cmap: photo.cmap,
-    cmapLabel: photo.cmapLabel,
     receivedAt: Date.now(),
   };
 
   const key = photoKey(mediaGroupId, photo.messageId);
   await env.ALBUM_BUFFER.put(key, '', {
-    expirationTtl: KV_TTL_S,
+    expirationTtl: KV_ALBUM_BUFFER_TTL_S,
     metadata,
   });
 }
@@ -268,19 +362,18 @@ async function writePhotoEntry(env, mediaGroupId, photo) {
  * stable ordering (Telegram delivers album photos in message_id order, but
  * KV list() does not guarantee any particular order).
  *
- * If the dispatched sentinel exists, callers should treat the album as
- * already-handled (checked separately via isAlreadyDispatched).
+ * If the flushed sentinel exists, callers should treat the album as
+ * already-handled (checked separately via isAlreadyFlushed).
  */
 async function gatherAlbum(env, mediaGroupId) {
   const prefix = `album:${mediaGroupId}:`;
-  const sentinel = dispatchedSentinelKey(mediaGroupId);
+  const sentinel = flushedSentinelKey(mediaGroupId);
   const entries = [];
   let cursor;
 
   do {
     const result = await env.ALBUM_BUFFER.list({ prefix, cursor, limit: 100 });
     for (const k of result.keys) {
-      // Skip the dispatched sentinel — it's not a photo.
       if (k.name === sentinel) continue;
       if (k.metadata) {
         entries.push({ name: k.name, metadata: k.metadata });
@@ -289,25 +382,23 @@ async function gatherAlbum(env, mediaGroupId) {
     cursor = result.list_complete ? null : result.cursor;
   } while (cursor);
 
-  // Sort by messageId for stable, predictable ordering.
   entries.sort((a, b) => a.metadata.messageId - b.metadata.messageId);
   return entries;
 }
 
 /**
- * Delete all photo keys for an album (called after a successful dispatch).
+ * Delete all photo keys for an album (called after a successful flush).
  *
- * Best-effort: if a delete fails, the key will auto-expire after KV_TTL_S.
+ * Best-effort: if a delete fails, the key will auto-expire after KV_ALBUM_BUFFER_TTL_S.
  */
 async function deleteAlbumKeys(env, mediaGroupId) {
   const prefix = `album:${mediaGroupId}:`;
-  const sentinel = dispatchedSentinelKey(mediaGroupId);
+  const sentinel = flushedSentinelKey(mediaGroupId);
   let cursor;
 
   do {
     const result = await env.ALBUM_BUFFER.list({ prefix, cursor, limit: 100 });
     for (const k of result.keys) {
-      // Don't delete the sentinel here — it has its own short TTL.
       if (k.name === sentinel) continue;
       await env.ALBUM_BUFFER.delete(k.name);
     }
@@ -316,25 +407,70 @@ async function deleteAlbumKeys(env, mediaGroupId) {
 }
 
 /**
- * Set the dispatched sentinel so sibling flush timers know to no-op.
+ * Set the flushed sentinel so sibling flush timers know to no-op.
  */
-async function markDispatched(env, mediaGroupId) {
-  await env.ALBUM_BUFFER.put(dispatchedSentinelKey(mediaGroupId), '1', {
+async function markFlushed(env, mediaGroupId) {
+  await env.ALBUM_BUFFER.put(flushedSentinelKey(mediaGroupId), '1', {
     expirationTtl: SENTINEL_TTL_S,
   });
 }
 
 /**
- * Check if the dispatched sentinel exists.
+ * Check if the flushed sentinel exists.
  */
-async function isAlreadyDispatched(env, mediaGroupId) {
-  const val = await env.ALBUM_BUFFER.get(dispatchedSentinelKey(mediaGroupId));
+async function isAlreadyFlushed(env, mediaGroupId) {
+  const val = await env.ALBUM_BUFFER.get(flushedSentinelKey(mediaGroupId));
   return val !== null;
 }
 
+// ---------------------------------------------------------------------------
+// KV session storage (for callback_query retrieval)
+// ---------------------------------------------------------------------------
+
 /**
- * Flush a buffered album: gather all photo entries from KV, fire a single
- * GitHub dispatch, notify the user, and clean up the KV keys.
+ * Write the consolidated session (photo_ids + metadata) to KV so the
+ * callback_query handler can fire the GitHub dispatch when the user taps a
+ * color button.
+ *
+ * Key:   session:{chatId}:{firstMessageId}
+ * TTL:   SESSION_TTL_S (10 minutes)
+ * Value: JSON.stringify({ chat_id, message_id, photo_ids, is_album,
+ *                          photo_count, caption })
+ */
+async function writeSession(env, chatId, firstMessageId, session) {
+  await env.ALBUM_BUFFER.put(sessionKey(chatId, firstMessageId), JSON.stringify(session), {
+    expirationTtl: SESSION_TTL_S,
+  });
+}
+
+/**
+ * Read and parse a session entry. Returns null if missing or invalid JSON.
+ */
+async function readSession(env, chatId, firstMessageId) {
+  const raw = await env.ALBUM_BUFFER.get(sessionKey(chatId, firstMessageId));
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delete a session entry (after the dispatch has fired, to prevent the user
+ * from tapping the button again and double-dispatching).
+ */
+async function deleteSession(env, chatId, firstMessageId) {
+  await env.ALBUM_BUFFER.delete(sessionKey(chatId, firstMessageId));
+}
+
+// ---------------------------------------------------------------------------
+// Flush: gather album, write session, show inline keyboard
+// ---------------------------------------------------------------------------
+
+/**
+ * Flush a buffered album: gather all photo entries from KV, write a session
+ * entry, send the inline keyboard, and clean up the per-photo KV keys.
  *
  * Called either:
  *   - immediately (in `ctx.waitUntil`) for single-photo messages, OR
@@ -342,8 +478,8 @@ async function isAlreadyDispatched(env, mediaGroupId) {
  *
  * Leader election by smallest message_id:
  *   Each album POST schedules its own flush. To avoid N sibling flushes each
- *   dispatching independently, only the photo with the SMALLEST message_id
- *   in the album dispatches. All other siblings no-op.
+ *   showing its own inline keyboard, only the photo with the SMALLEST
+ *   message_id in the album flushes. All other siblings no-op.
  *
  *   Telegram delivers album photos in message_id order, so the smallest
  *   message_id is the FIRST photo of the album. Its flush is the "leader".
@@ -355,9 +491,9 @@ async function isAlreadyDispatched(env, mediaGroupId) {
  *
  *   The leader's flush does a retry loop: gather, wait, gather again. If the
  *   count is still growing, keep retrying (up to FLUSH_RETRIES). When the
- *   count is stable, dispatch whatever we have.
+ *   count is stable, flush whatever we have.
  *
- *   The sentinel key prevents double-dispatch if the leader crashes mid-flush
+ *   The sentinel key prevents double-flush if the leader crashes mid-flush
  *   and a sibling's retry loop later sees a stable count.
  *
  * `myMessageId` is the message_id of the photo that triggered THIS flush.
@@ -365,9 +501,9 @@ async function isAlreadyDispatched(env, mediaGroupId) {
  * For albums, the leader check is: am I the smallest message_id in the album?
  */
 async function flushAlbum(env, mediaGroupId, isAlbum, myMessageId) {
-  // Check sentinel first — a sibling flush may have already dispatched.
-  if (await isAlreadyDispatched(env, mediaGroupId)) {
-    console.log(`[flush] ${mediaGroupId} already dispatched, skipping`);
+  // Check sentinel first — a sibling flush may have already flushed.
+  if (await isAlreadyFlushed(env, mediaGroupId)) {
+    console.log(`[flush] ${mediaGroupId} already flushed, skipping`);
     return;
   }
 
@@ -377,9 +513,7 @@ async function flushAlbum(env, mediaGroupId, isAlbum, myMessageId) {
     return;
   }
 
-  // Leader election: only the photo with the smallest message_id dispatches.
-  // This guarantees exactly ONE dispatch per album, regardless of how many
-  // sibling flushes fire or which colo they run on.
+  // Leader election: only the photo with the smallest message_id flushes.
   if (isAlbum) {
     const minMessageId = Math.min(...entries.map((e) => e.metadata.messageId));
     if (myMessageId !== minMessageId) {
@@ -392,16 +526,12 @@ async function flushAlbum(env, mediaGroupId, isAlbum, myMessageId) {
   }
 
   // Retry loop: re-gather a few times to let KV propagate sibling writes.
-  // This is the critical fix for KV eventual consistency — without it, the
-  // leader might dispatch with only 1-2 photos even though 4 were sent,
-  // because the sibling writes haven't propagated to the leader's colo yet.
   let lastCount = entries.length;
   for (let attempt = 1; attempt <= FLUSH_RETRIES; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, FLUSH_RETRY_DELAY_MS));
 
-    // Re-check sentinel — a sibling may have dispatched while we waited.
-    if (await isAlreadyDispatched(env, mediaGroupId)) {
-      console.log(`[flush] ${mediaGroupId} dispatched by sibling during retry ${attempt}`);
+    if (await isAlreadyFlushed(env, mediaGroupId)) {
+      console.log(`[flush] ${mediaGroupId} flushed by sibling during retry ${attempt}`);
       return;
     }
 
@@ -421,18 +551,16 @@ async function flushAlbum(env, mediaGroupId, isAlbum, myMessageId) {
       continue;
     }
 
-    // Count is stable — KV has propagated. Use these entries.
     if (reEntries.length !== entries.length) {
       entries = reEntries;
     }
     console.log(
-      `[flush] ${mediaGroupId} retry ${attempt}: count stable at ${reEntries.length}, dispatching`
+      `[flush] ${mediaGroupId} retry ${attempt}: count stable at ${reEntries.length}, flushing`
     );
     break;
   }
 
-  // Cap at MAX_PHOTOS_PER_BATCH defensively. Telegram's UI already limits
-  // albums to 10, but if a malformed update arrives with more, we drop extras.
+  // Cap at MAX_PHOTOS_PER_BATCH defensively.
   const capped = entries.slice(0, MAX_PHOTOS_PER_BATCH);
   const photoIds = capped.map((e) => e.metadata.fileId);
 
@@ -441,66 +569,197 @@ async function flushAlbum(env, mediaGroupId, isAlbum, myMessageId) {
   const firstCaption =
     capped.map((e) => e.metadata.caption).find((c) => c && c.trim().length > 0) || '';
 
-  // Use the FIRST photo's chat/message/model/cmap — all photos in an album
-  // share the same chat, and the first photo's caption determines the flags.
   const first = capped[0].metadata;
   const chatId = first.chatId;
-  const messageId = first.messageId;
-  const model = first.model;
-  const modelLabel = first.modelLabel;
-  const cmap = first.cmap;
-  const cmapLabel = first.cmapLabel;
-
+  const firstMessageId = first.messageId;
   const count = photoIds.length;
   const label = isAlbum ? `album (${count} photos)` : 'photo';
 
   console.log(
-    `[flush] dispatching ${label}: model=${modelLabel} cmap=${cmapLabel} ` +
-    `photos=${count} media_group_id=${mediaGroupId}`
+    `[flush] ${label}: photos=${count} media_group_id=${mediaGroupId} ` +
+    `-> showing inline keyboard`
   );
 
-  // Set the dispatched sentinel BEFORE firing the GitHub dispatch. This
-  // minimizes the race window where a sibling flush could also fire a dispatch.
-  await markDispatched(env, mediaGroupId);
+  // Set the flushed sentinel BEFORE sending the keyboard. This minimizes the
+  // race window where a sibling flush could also send a keyboard.
+  await markFlushed(env, mediaGroupId);
 
-  const dispatchPayload = {
+  // Write the session entry so the callback_query handler can fire the
+  // GitHub dispatch when the user taps a color button.
+  const session = {
     chat_id: chatId,
-    message_id: messageId,
+    message_id: firstMessageId,
     photo_ids: photoIds,
-    model,
-    cmap,
     is_album: isAlbum,
     photo_count: count,
     caption: firstCaption,
+    created_at: Date.now(),
   };
+  await writeSession(env, chatId, firstMessageId, session);
 
-  try {
-    await triggerGitHubAction(env, dispatchPayload);
-  } catch (err) {
-    console.error(`[flush] dispatch error for ${label}:`, err);
+  // Send the inline keyboard. The bot token is read here (not earlier) so
+  // that any token-loading cost happens after KV writes, keeping the
+  // critical path tight.
+  const buttonMessageId = await sendInlineKeyboard(
+    env.TELEGRAM_BOT_TOKEN,
+    chatId,
+    firstMessageId,
+    isAlbum,
+    count
+  );
+
+  if (buttonMessageId === null) {
+    // sendMessage failed — notify the user via plain text and clean up.
+    console.error(`[flush] sendInlineKeyboard failed for ${label}`);
     await notifyTelegram(
       env.TELEGRAM_BOT_TOKEN,
       chatId,
-      `⚠️ Could not start the depth job for your ${label}. The action dispatcher failed. Try again in a moment.`
+      `⚠️ Couldn't show the color picker for your ${label}. Try sending it again.`
     );
-    // Clean up the buffer so a retry starts fresh.
+    await deleteSession(env, chatId, firstMessageId);
     await deleteAlbumKeys(env, mediaGroupId);
     return;
   }
 
-  const eta = model === MODEL_LARGE ? '1–3 min (large model)' : '~30–60s (small model)';
-  const perPhoto = model === MODEL_LARGE ? '~15s/photo' : '~2s/photo';
-  const albumHint = isAlbum ? `\nBatch processing: ${perPhoto} per photo.` : '';
-  await notifyTelegram(
-    env.TELEGRAM_BOT_TOKEN,
-    chatId,
-    `Queued *${modelLabel}* depth run with *${cmapLabel}* output for your ${label}.\n` +
-    `ETA: ${eta}${albumHint}\n` +
-    `I'll reply here with the depth map${isAlbum ? 's' : ''} when it's done.`
+  console.log(
+    `[flush] inline keyboard sent: button_msg=${buttonMessageId} ` +
+    `session=session:${chatId}:${firstMessageId}`
   );
 
-  // Clean up the photo keys. Sentinel auto-expires.
+  // Clean up the per-photo keys. Sentinel auto-expires.
   await deleteAlbumKeys(env, mediaGroupId);
+}
+
+// ---------------------------------------------------------------------------
+// Callback query handler — fires when the user taps an inline keyboard button
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle a callback_query from a tapped inline keyboard button.
+ *
+ * CRITICAL: answerCallbackQuery MUST be the first HTTP call. Telegram shows a
+ * loading spinner on the tapped button that auto-dismisses on
+ * answerCallbackQuery or after 10s. Doing any slow work first makes the bot
+ * feel broken.
+ *
+ * Steps (per spec):
+ *   1. IMMEDIATE: answerCallbackQuery with text 'Processing depth map...'
+ *   2. INLINE:    editMessageText on the keyboard message →
+ *                 '⏳ Generating HD Depth Map...'
+ *   3. ctx.waitUntil: read session from KV, fire repository_dispatch with
+ *                 model=Depth-Anything-V2-Large-hf and cmap (inferno|gray).
+ *
+ * callback_data format: `process:{cmap}:{photo_message_id}`
+ *   - cmap: 'inferno' or 'gray'
+ *   - photo_message_id: the message_id of the FIRST photo (used as the KV
+ *     session key suffix)
+ */
+async function handleCallbackQuery(env, ctx, callbackQuery) {
+  const callbackQueryId = callbackQuery.id;
+  const fromId = callbackQuery.from?.id;
+  const chatId = callbackQuery.message?.chat?.id;
+  const buttonMessageId = callbackQuery.message?.message_id;
+  const data = callbackQuery.data || '';
+  const botToken = env.TELEGRAM_BOT_TOKEN;
+  const allowedUserId = parseInt(env.ALLOWED_TELEGRAM_USER_ID, 10);
+
+  // Auth firewall — same silent-drop behavior as the message path.
+  if (!fromId || fromId !== allowedUserId) {
+    // Still answer the callback so the spinner stops, but do nothing else.
+    if (callbackQueryId) {
+      await answerCallbackQuery(botToken, callbackQueryId, 'Unauthorized');
+    }
+    return;
+  }
+
+  // Parse callback_data: 'process:{cmap}:{photo_message_id}'
+  const parts = data.split(':');
+  if (parts.length !== 3 || parts[0] !== 'process') {
+    console.warn(`[callback] unparseable callback_data: ${data}`);
+    await answerCallbackQuery(botToken, callbackQueryId, 'Bad request');
+    return;
+  }
+  const cmap = parts[1];
+  const photoMessageId = parseInt(parts[2], 10);
+  if ((cmap !== 'inferno' && cmap !== 'gray') || Number.isNaN(photoMessageId)) {
+    console.warn(`[callback] invalid cmap or photoMessageId in: ${data}`);
+    await answerCallbackQuery(botToken, callbackQueryId, 'Bad request');
+    return;
+  }
+
+  // ─── STEP 1 (IMMEDIATE) ────────────────────────────────────────────────
+  // answerCallbackQuery FIRST. This kills the Telegram button spinner in
+  // <100ms. Do NOT do any KV reads or GitHub dispatches before this line.
+  await answerCallbackQuery(botToken, callbackQueryId, 'Processing depth map...');
+
+  // ─── STEP 2 (INLINE) ───────────────────────────────────────────────────
+  // Edit the inline keyboard message to show "⏳ Generating..." and remove
+  // the buttons (so the user can't tap again and double-dispatch).
+  const cmapLabel = cmap === 'inferno' ? 'inferno colormap' : 'grayscale';
+  await editMessageText(
+    botToken,
+    chatId,
+    buttonMessageId,
+    `⏳ Generating HD Depth Map...\n\n` +
+    `Render: *${cmapLabel}*\n` +
+    `Model: \`Depth-Anything-V2-Large-hf\`\n` +
+    `ETA: 1–3 min (warm cache faster)`,
+    { inline_keyboard: [] }  // remove the buttons
+  );
+
+  // ─── STEP 3 (ctx.waitUntil) ────────────────────────────────────────────
+  // Fire the GitHub dispatch in the background. We move this to
+  // ctx.waitUntil so the Worker can return 200 to Telegram immediately,
+  // keeping the webhook healthy.
+  ctx.waitUntil(
+    (async () => {
+      try {
+        const session = await readSession(env, chatId, photoMessageId);
+        if (!session) {
+          console.warn(
+            `[callback] session not found for session:${chatId}:${photoMessageId} ` +
+            `(likely expired after ${SESSION_TTL_S}s)`
+          );
+          await notifyTelegram(
+            botToken,
+            chatId,
+            '⚠️ This button expired. Please send the photo(s) again to get a fresh depth map.'
+          );
+          return;
+        }
+
+        console.log(
+          `[callback] dispatching: cmap=${cmap} photos=${session.photo_count} ` +
+          `is_album=${session.is_album}`
+        );
+
+        const dispatchPayload = {
+          chat_id: session.chat_id,
+          message_id: session.message_id,
+          photo_ids: session.photo_ids,
+          model: MODEL_LARGE,
+          cmap,
+          is_album: session.is_album,
+          photo_count: session.photo_count,
+          caption: session.caption || '',
+        };
+
+        await triggerGitHubAction(env, dispatchPayload);
+
+        // Delete the session so a second tap on a stale button (e.g. if the
+        // user re-tapped before editMessageText removed the buttons) doesn't
+        // fire a second dispatch.
+        await deleteSession(env, chatId, photoMessageId);
+      } catch (err) {
+        console.error('[callback] dispatch error:', err);
+        await notifyTelegram(
+          botToken,
+          chatId,
+          `⚠️ Could not start the depth job. The dispatcher failed: ${err.message?.slice(0, 200)}`
+        );
+      }
+    })()
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +780,26 @@ export default {
       return new Response(null, { status: 200 });
     }
 
+    // ─── callback_query branch (inline keyboard button tap) ──────────────
+    // Handle this BEFORE the message branch — callback_query events have a
+    // 10s button-spinner timeout that the message path doesn't, so it's the
+    // more time-critical path.
+    if (body.callback_query) {
+      // STEP 1 (answerCallbackQuery) happens inside handleCallbackQuery as
+      // the FIRST HTTP call. We don't do any other work here that could
+      // delay it.
+      try {
+        await handleCallbackQuery(env, ctx, body.callback_query);
+      } catch (err) {
+        console.error('[callback] handler threw:', err);
+      }
+      return new Response(
+        JSON.stringify({ ok: true, handled: 'callback_query' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // ─── message branch (photo upload or text command) ───────────────────
     const message = body.message || body.edited_message;
     if (!message) {
       return new Response(null, { status: 200 });
@@ -530,40 +809,31 @@ export default {
     const chatId = message.chat?.id;
     const allowedUserId = parseInt(env.ALLOWED_TELEGRAM_USER_ID, 10);
 
-    // ---- 1. Auth firewall ------------------------------------------------
-    // Unknown users are silently dropped. We return 200 (not 401/403) so the
-    // bot looks indistinguishable from a dead endpoint to a scanner.
+    // Auth firewall — unknown users get an identical 200 OK so the bot looks
+    // indistinguishable from a dead endpoint to a scanner.
     if (!fromId || fromId !== allowedUserId) {
       return new Response(null, { status: 200 });
     }
 
-    // ---- 2. Parse the message --------------------------------------------
-    // Telegram delivers standalone text commands as `message.text`, and photo
-    // uploads with a caption as `message.caption`. We normalize to one string
-    // so the parser doesn't care which path the user took.
-    const rawText = (message.text || message.caption || '').trim();
-    const { model, modelLabel, cmap, cmapLabel } = parseCommandPayload(rawText);
-
-    // ---- 3. Reject non-photo messages with a friendly hint ---------------
+    // Reject non-photo messages with a friendly hint.
     const photo = Array.isArray(message.photo) && message.photo.length > 0
       ? message.photo[message.photo.length - 1]  // highest resolution
       : null;
 
     if (!photo) {
+      const rawText = (message.text || message.caption || '').trim();
       const botToken = env.TELEGRAM_BOT_TOKEN;
       if (rawText.startsWith('/start')) {
         await notifyTelegram(
           botToken,
           chatId,
           '*Depth bot reporting in.*\n\n' +
-          'Send me a photo (or an album!) and I will reply with monocular depth maps.\n\n' +
-          '*Flags* (combine freely in the caption):\n' +
-          '• `/hd` — large model (default)\n' +
-          '• `/fast` — small model\n' +
-          '• `/gray` — pure grayscale (default)\n' +
-          '• `/color` — inferno colormap\n\n' +
-          'Example: attach a photo, caption `/hd /color`. ' +
-          'Or attach multiple photos as an album — they\'ll be processed together in a single run.'
+          'Send me a photo (or an album!) and I will reply with two buttons:\n\n' +
+          '• 🎨 *HD Color* — inferno colormap\n' +
+          '• 🏁 *HD Grayscale* — pure 0–255 grayscale\n\n' +
+          'Tap one and I\'ll generate a high-quality depth map with the ' +
+          '`Depth-Anything-V2-Large` model. ETA ~1–3 min depending on cache warmth.\n\n' +
+          '_The /fast small-model option has been retired — every run is HD._'
         );
       } else if (rawText.startsWith('/help')) {
         await notifyTelegram(
@@ -571,10 +841,10 @@ export default {
           chatId,
           '*Usage:*\n' +
           '1. Attach a photo (or an album of up to 10) to your message.\n' +
-          '2. Optionally caption it with flags: `/hd` `/fast` `/gray` `/color`.\n' +
-          '3. Wait ~1–3 minutes for the depth map.\n\n' +
-          '*Defaults:* HD model + grayscale output.\n\n' +
-          '*Albums:* all photos in a single album are buffered for 1.5s and ' +
+          '2. I\'ll reply with two buttons: 🎨 HD Color and 🏁 HD Grayscale.\n' +
+          '3. Tap the one you want. I\'ll start the depth run and reply with the result.\n\n' +
+          '*Model:* `Depth-Anything-V2-Large-hf` (hardcoded — Small retired).\n\n' +
+          '*Albums:* all photos in a single album are buffered for 2.5s and ' +
           'processed in one GitHub Actions run, and you get a single reply album back.\n\n' +
           'Everything runs on GitHub Actions runners; nothing is stored.'
         );
@@ -582,7 +852,7 @@ export default {
         await notifyTelegram(
           botToken,
           chatId,
-          'Send me a photo or album. Flags: `/hd` `/fast` `/gray` `/color`. Defaults to HD + grayscale.'
+          'Send me a photo or album — I\'ll show you HD Color and HD Grayscale buttons to pick from.'
         );
       }
       return new Response(JSON.stringify({ ok: true, status: 'no_photo' }), {
@@ -591,31 +861,23 @@ export default {
       });
     }
 
-    // ---- 4. Buffer the photo (album-aware) -------------------------------
+    // ─── Buffer the photo (album-aware) ───────────────────────────────────
     const mediaGroupId = message.media_group_id || null;
     const isAlbum = !!mediaGroupId;
+    const rawText = (message.text || message.caption || '').trim();
 
     if (isAlbum) {
       // Album path: write the photo to KV under its own key, then schedule
-      // a debounced flush. The LAST photo's flush (the one that fires after
-      // the album has been quiet for MEDIA_GROUP_BUFFER_MS) does the dispatch.
+      // a debounced flush. The leader (smallest message_id) flushes.
       await writePhotoEntry(env, mediaGroupId, {
         chatId,
         messageId: message.message_id,
         fileId: photo.file_id,
         caption: rawText,
-        model,
-        modelLabel,
-        cmap,
-        cmapLabel,
       });
 
       ctx.waitUntil(
         (async () => {
-          // Wait MEDIA_GROUP_BUFFER_MS so siblings can land in KV. The flush
-          // function will use leader election (smallest message_id) to ensure
-          // exactly ONE dispatch per album, regardless of how many sibling
-          // flushes fire or which colo they run on.
           await new Promise((resolve) => setTimeout(resolve, MEDIA_GROUP_BUFFER_MS));
           try {
             await flushAlbum(env, mediaGroupId, true, message.message_id);
@@ -630,29 +892,20 @@ export default {
           ok: true,
           buffered: true,
           is_album: true,
-          photo_count_in_batch_so_far: 1, // sibling photos may append more
-          model,
-          cmap,
+          photo_count_in_batch_so_far: 1,
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
     }
 
-    // Single-photo path: no buffer, no debounce. Dispatch immediately.
-    // We still use ctx.waitUntil so we can respond 200 to Telegram instantly
-    // and let the GitHub dispatch + Telegram notify happen in the background.
+    // Single-photo path: no buffer, no debounce. Reuse the flush path by
+    // synthesizing a per-photo "album" key.
     const singleKey = `single:${chatId}:${message.message_id}`;
-
-    // Write a one-photo "album" entry so we can reuse the flush path.
     await writePhotoEntry(env, singleKey, {
       chatId,
       messageId: message.message_id,
       fileId: photo.file_id,
       caption: rawText,
-      model,
-      modelLabel,
-      cmap,
-      cmapLabel,
     });
 
     ctx.waitUntil(
@@ -670,8 +923,6 @@ export default {
         ok: true,
         buffered: true,
         is_album: false,
-        model,
-        cmap,
       }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
