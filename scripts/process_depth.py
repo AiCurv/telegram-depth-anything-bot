@@ -40,7 +40,6 @@ from typing import List, Tuple
 
 import matplotlib
 matplotlib.use("Agg")  # headless
-import matplotlib.pyplot as plt
 import numpy as np
 import requests
 from PIL import Image
@@ -244,58 +243,69 @@ def render_depth_map(depth_arr: np.ndarray, source: Image.Image, cmap: str,
                      out_path: str) -> Tuple[float, float]:
     """Render the depth array to a PNG file on disk.
 
-    Two modes:
-      - 'gray'    : min-max normalize the depth to 0-255, save as a single-
-                    channel grayscale PNG (mode='L' in PIL). No colormap is
-                    applied — the brightness directly encodes relative depth,
-                    which is the most faithful 2D representation.
-      - 'inferno' : apply matplotlib's inferno colormap, save as RGB PNG.
-                    Better for human visual scanning of depth gradients.
+    Implements strict independent per-image float32 min-max normalization,
+    matching the official Hugging Face Depth Anything V2 implementation:
 
-    Both modes resize the output to <= MAX_OUTPUT_SIDE px on the longest side
-    using LANCZOS resampling, preserving aspect ratio.
+        d_min = depth.min()
+        d_max = depth.max()
+        normalized = (depth - d_min) / (d_max - d_min)
+
+    d_min / d_max are computed fresh for THIS image only. No tensor bounds are
+    cached or leaked across loop iterations, so batch albums and repeated
+    images each get their own full dynamic range stretched to [0, 1].
+
+    Two render modes (both saved as 3-channel RGB PNGs):
+      - 'gray'    : normalized * 255 -> uint8, broadcast to RGB (R=G=B).
+                    This is the most faithful 2D representation — brightness
+                    directly encodes relative depth, no colormap applied.
+      - 'inferno' : matplotlib.colormaps['inferno'](normalized) maps every
+                    float pixel directly to an RGB triple. Bypasses
+                    plt.imshow / savefig entirely, so there is no figure
+                    padding, no DPI scaling, no axis spine, no aspect-ratio
+                    stretching — pixel-exact output matching the HF Space.
+
+    Both modes resize the depth array to <= MAX_OUTPUT_SIDE px on the longest
+    side using LANCZOS resampling BEFORE normalization, preserving aspect
+    ratio. Resize happens on the float32 tensor so no quantization is
+    introduced before the colormap is applied.
 
     Returns (min_depth, max_depth) for stats reporting.
     """
     target_w, target_h = _resize_to_cap(source)
 
-    # Resize the depth array to match the target output dimensions. We use
-    # PIL's LANCZOS for a clean, non-jagged downscale.
+    # Resize the float32 depth tensor to the target output dimensions.
+    # PIL mode="F" keeps full float32 precision through LANCZOS resampling.
     depth_pil_full = Image.fromarray(depth_arr, mode="F")
     depth_pil_resized = depth_pil_full.resize((target_w, target_h), Image.LANCZOS)
-    depth_resized = np.array(depth_pil_resized)
+    depth_resized = np.asarray(depth_pil_resized, dtype=np.float32)
 
+    # STRICT per-image min-max normalization. No clipping, no shared bounds,
+    # no cached min/max from previous loop iterations.
     dmin = float(depth_resized.min())
     dmax = float(depth_resized.max())
+    rng = dmax - dmin
+    if rng < 1e-6:
+        # Degenerate flat depth — render as all-black rather than dividing by ~0.
+        normalized = np.zeros_like(depth_resized, dtype=np.float32)
+    else:
+        normalized = (depth_resized - dmin) / rng  # float32 in [0, 1]
 
     if cmap == "gray":
-        # Min-max normalize to 0-255 uint8.
-        rng = dmax - dmin
-        if rng < 1e-6:
-            normalized = np.zeros_like(depth_resized, dtype=np.uint8)
-        else:
-            normalized = ((depth_resized - dmin) / rng * 255.0)
-            normalized = np.clip(normalized, 0, 255).astype(np.uint8)
-
-        gray_img = Image.fromarray(normalized, mode="L")
-        gray_img.save(out_path, format="PNG", optimize=True)
+        # Scale normalized floats to uint8 [0, 255] and broadcast to 3-channel
+        # RGB so the output PNG has consistent shape with the inferno path.
+        depth_uint8 = np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
+        rgb = np.repeat(depth_uint8[..., np.newaxis], 3, axis=-1)
+        Image.fromarray(rgb, mode="RGB").save(out_path, format="PNG", optimize=True)
     else:
-        # cmap == 'inferno'
-        # Size the matplotlib figure so its pixel output matches (target_w, target_h)
-        # exactly. dpi=100 -> figsize = (pixels / 100).
-        fig_w = target_w / 100.0
-        fig_h = target_h / 100.0
-
-        fig, ax = plt.subplots(
-            figsize=(fig_w, fig_h),
-            constrained_layout=True,
-        )
-        ax.imshow(depth_resized, cmap="inferno", aspect="auto")
-        ax.axis("off")
-
-        # pad_inches=0 + constrained_layout keeps the canvas exactly the image.
-        fig.savefig(out_path, format="png", dpi=100, pad_inches=0)
-        plt.close(fig)
+        # cmap == 'inferno' — apply the colormap directly to the normalized
+        # float tensor. matplotlib.colormaps['inferno'] returns an RGBA array
+        # of shape (H, W, 4) with values in [0, 1]. We drop the alpha channel
+        # and quantize to uint8. This is the exact pipeline the HF Space uses,
+        # bypassing pyplot's figure/axes machinery entirely.
+        rgba = matplotlib.colormaps["inferno"](normalized)
+        rgb = rgba[..., :3]  # drop alpha
+        rgb_uint8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+        Image.fromarray(rgb_uint8, mode="RGB").save(out_path, format="PNG", optimize=True)
 
     return dmin, dmax
 
