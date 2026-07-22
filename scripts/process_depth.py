@@ -10,8 +10,7 @@ Pipeline:
     2. Download all source photos from Telegram via getFile + file download URL.
        Partial download failures are tolerated — we process whatever subset
        came through.
-    3. Load the requested Hugging Face pipeline ONCE (small for /fast, large
-       for /hd).
+    3. Load the Depth Anything V2 Large Hugging Face pipeline ONCE.
     4. Loop through downloaded photos, run monocular depth estimation per
        image, and render each to a depth PNG (grayscale or inferno based on
        --cmap).
@@ -214,6 +213,17 @@ def send_telegram_media_group(chat_id: str, photo_paths: List[str],
 
 
 # ---------------------------------------------------------------------------
+# Model (hardcoded)
+# ---------------------------------------------------------------------------
+#
+# The Small model (Depth-Anything-V2-Small-hf) has been retired. We always
+# run Depth-Anything-V2-Large-hf for maximum quality. The Cloudflare Worker
+# no longer parses /fast or /small flags — model selection is gone from the
+# entire pipeline.
+
+MODEL_NAME = "depth-anything/Depth-Anything-V2-Large-hf"
+
+# ---------------------------------------------------------------------------
 # Depth inference (batch-aware)
 # ---------------------------------------------------------------------------
 
@@ -336,8 +346,8 @@ def run_batch_inference(image_paths: List[str], model_name: str, cmap: str,
 # ---------------------------------------------------------------------------
 
 # Friendly display names for the final caption.
+# Only the Large model remains — Small has been purged from the pipeline.
 MODEL_LABELS = {
-    "depth-anything/Depth-Anything-V2-Small-hf": "Small (fast)",
     "depth-anything/Depth-Anything-V2-Large-hf": "Large (HD)",
 }
 CMAP_LABELS = {
@@ -357,8 +367,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--model",
-        default="depth-anything/Depth-Anything-V2-Large-hf",
-        help="Hugging Face model id. Defaults to the Large (HD) model.",
+        default=MODEL_NAME,
+        help=argparse.SUPPRESS,  # Hardcoded to Large; flag kept only for backward compat.
     )
     p.add_argument(
         "--cmap",
@@ -410,7 +420,11 @@ def main() -> int:
     workdir = "/tmp/depth_work"
     os.makedirs(workdir, exist_ok=True)
 
-    model_label = MODEL_LABELS.get(args.model, args.model)
+    # Force the Large model regardless of what --model was passed. The flag is
+    # kept only so older workflow_dispatch payloads that still include `model`
+    # don't crash argparse; the value is overwritten here.
+    model_name = MODEL_NAME
+    model_label = MODEL_LABELS[model_name]
     cmap_label = CMAP_LABELS.get(args.cmap, args.cmap)
     is_album = len(photo_ids) > 1
 
@@ -431,7 +445,7 @@ def main() -> int:
 
         # 3. Run batch inference (model loaded ONCE).
         image_paths = [p for (_, p) in downloaded]
-        results = run_batch_inference(image_paths, args.model, args.cmap, workdir)
+        results = run_batch_inference(image_paths, model_name, args.cmap, workdir)
         if not results:
             raise RuntimeError("All inference attempts failed")
 
@@ -443,7 +457,7 @@ def main() -> int:
             # Album reply via sendMediaGroup.
             caption = (
                 f"✅ *Depth maps ready.*\n"
-                f"Model: `{args.model}` ({model_label})\n"
+                f"Model: `{model_name}` ({model_label})\n"
                 f"Render: `{args.cmap}` ({cmap_label})\n"
                 f"Photos: {len(output_paths)}/{len(photo_ids)} processed"
             )
@@ -455,7 +469,7 @@ def main() -> int:
             src_img = Image.open(image_paths[0])
             caption = (
                 f"✅ *Depth map ready.*\n"
-                f"Model: `{args.model}` ({model_label})\n"
+                f"Model: `{model_name}` ({model_label})\n"
                 f"Render: `{args.cmap}` ({cmap_label})\n"
                 f"Source: {src_img.size[0]}×{src_img.size[1]} px\n"
                 f"Depth range: `{dmin:.1f}`–`{dmax:.1f}` (relative)"
@@ -470,8 +484,8 @@ def main() -> int:
         traceback.print_exc()
         send_telegram_text(
             args.chat_id,
-            f"❌ Depth run failed: `{str(exc)[:200]}`\nTry `/fast` instead of `/hd`, "
-            f"or send fewer photos.",
+            f"❌ Depth run failed: `{str(exc)[:200]}`\nTry sending fewer photos, "
+            f"or retry in a moment.",
         )
         return 1
 
